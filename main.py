@@ -180,6 +180,10 @@ parser.add_argument('--eval_mode', default=False)
 parser.add_argument("--grad_normalization", default=0, type=int)
 parser.add_argument('--use_yp_argmax', default=False)
 
+parser.add_argument("--prob_mix", default=1.0, type=float)
+parser.add_argument("--mix_schedule", default='fixed', choices=['fixed','scheduled','delayed'])
+parser.add_argument("--mix_scheduled_epoch", default=300, type=int)
+
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
 
@@ -305,6 +309,25 @@ def accuracy(output, target, topk=(1, )):
         res.append(correct_k.mul_(100.0 / batch_size))
     return res
 
+def get_prob_mix(mix_schedule, max_prob, epoch, scheduled_epoch):
+    """
+    with scheldued mix,
+    if epoch < scheduled_epoch, we linearly increase the mix prob from 0 to max_prob
+    if epoch > scheduled_epoch, we fix the prob at max_prob
+    """
+    if mix_schedule == 'fixed':
+        prob_mix = max_prob
+    elif mix_schedule == 'scheduled':
+        if epoch+1>=scheduled_epoch:
+            prob_mix = max_prob
+        else:
+            prob_mix = (epoch+1)/scheduled_epoch*max_prob
+    elif mix_schedule == 'delayed':
+        if epoch>=scheduled_epoch:
+            prob_mix = max_prob
+        else:
+            prob_mix = 0
+    return prob_mix
 
 bce_loss = nn.BCELoss().cuda()
 bce_loss_sum = nn.BCELoss(reduction='sum').cuda()
@@ -321,12 +344,17 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
     top1 = AverageMeter()
     top5 = AverageMeter()
     mixing_avg = []
+    prob_mix = get_prob_mix(args.mix_schedule, args.prob_mix, epoch, args.mix_scheduled_epoch)
+
 
     try:
         base_itr = int(train_loader.dataset.data.shape[0]/train_loader.batch_size)*epoch
     except AttributeError:
         base_itr = int(len(train_loader.dataset.imgs)/train_loader.batch_size*epoch)
     
+    if args.blur_sigma != 0.:
+        blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
+
     # switch to train mode
     model.train()
 
@@ -417,53 +445,80 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
         # integrating our method :AVery
         elif args.train == 'ours':
-            input_var = Variable(input, requires_grad=True)
-            target_var = Variable(target)
 
-            # calculate saliency
-            if args.eval_mode:
-                model.eval()
+            batch_size = input.shape[0]
+            mix_size = int(batch_size*prob_mix)
+
+            # if mix_size is 0, we are simply doing standard training with no DA
+            if mix_size == 0:
+                input_var, target_var = Variable(input), Variable(target)
+                output, reweighted_target = model(input_var, target_var)
+                loss = bce_loss(softmax(output), reweighted_target)
             else:
+                if mix_size == batch_size:
+                    # entire batch is DA
+                    input_2b_mixed = input
+                    target_2b_mixed = target
+                    input_std = None
+                    target_std = None
+                else:
+                    # some inputs are augmented, some are not
+                    input_std, input_2b_mixed = input[:(batch_size-mix_size)], input[(batch_size-mix_size):]
+                    target_std, target_2b_mixed = target[:(batch_size-mix_size)], target[(batch_size-mix_size):]
+
+                input_2b_mixed_var = Variable(input_2b_mixed, requires_grad=True)
+                target_2b_mixed_var = Variable(target_2b_mixed)
+
+                # calculate saliency
+                if args.eval_mode:
+                    model.eval()
+                else:
+                    model.train()
+                output = model(input_2b_mixed_var)
+
+                if args.use_yp_argmax:
+                    loss_batch = criterion_batch(output, output.argmax(dim=1))
+                else:
+                    loss_batch = criterion_batch(output, target_2b_mixed_var)
+
+                loss_batch_mean = torch.mean(loss_batch, dim=0)
+                loss_batch_mean.backward(retain_graph=True)
+
                 model.train()
-            output = model(input_var)
-            
-            if args.use_yp_argmax:
-                loss_batch = criterion_batch(output, output.argmax(dim=1))
-            else:
-                loss_batch = criterion_batch(output, target_var)
 
-            loss_batch_mean = torch.mean(loss_batch, dim=0)
-            loss_batch_mean.backward(retain_graph=True)
+                g = input_2b_mixed_var.grad.data.abs().mean(dim=1,keepdim=True).detach()
 
-            model.train()
+                # apply gaussian bluring to the gradients
+                if args.blur_sigma != 0.:
+                    blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
+                    g_tilde = blurrer(g)
 
-            g = input_var.grad.data.abs().mean(dim=1,keepdim=True).detach()
+                if args.grad_normalization==1:
+                    g_tilde = g_tilde/torch.norm(g_tilde,p=2,dim=[1,2,3],keepdim=True)
+                elif args.grad_normalization==2:
+                    g_tilde = g_tilde/g_tilde.sum(dim=[1,2,3],keepdim=True)
+                elif args.grad_normalization==3:
+                    g_tilde = g_tilde-g_tilde.amin(dim=[1,2,3],keepdim=True)
+                    g_tilde = (g_tilde/g_tilde.amax(dim=[1,2,3],keepdim=True)).clamp(min=1e-6)
 
-            # apply gaussian bluring to the gradients
-            if args.blur_sigma != 0.:
-                blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
-                g_tilde = blurrer(g)
+                mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var, target_2b_mixed_var, g_tilde)
+                reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
 
-            if args.grad_normalization==1:
-                g_tilde = g_tilde/torch.norm(g_tilde,p=2,dim=[1,2,3],keepdim=True)
-            elif args.grad_normalization==2:
-                g_tilde = g_tilde/g_tilde.sum(dim=[1,2,3],keepdim=True)
-            elif args.grad_normalization==3:
-                g_tilde = g_tilde-g_tilde.amin(dim=[1,2,3],keepdim=True)
-                g_tilde = (g_tilde/g_tilde.amax(dim=[1,2,3],keepdim=True)).clamp(min=1e-6)
+                optimizer.zero_grad()
 
-            mixed_x, mixed_y, mixed_lam = gradmix(input_var, target_var, g_tilde)
-            reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+                # perform mixup and calculate loss
+                output_mix = model(mixed_x)
+                loss = bce_loss(softmax(output_mix), reweighted_target)
 
-            optimizer.zero_grad()
+                if input_std is not None:
+                    input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                    output_std, reweighted_target_std = model(input_std_var, target_std_var)
+                    loss += bce_loss(softmax(output_std), reweighted_target_std)
 
-            # perform mixup and calculate loss
-            output = model(mixed_x)
-            loss = bce_loss(softmax(output), reweighted_target)
-
-            if args.enable_wandb:
-                wandb_logger.add_scalar('lambda/mean_itr', mixed_lam[0].mean().item(), base_itr+i)
-                wandb_logger.add_scalar('lambda/std_itr', mixed_lam[0].std().item(), base_itr+i)
+                if args.enable_wandb:
+                    wandb_logger.add_scalar('lambda/mean_itr', mixed_lam[0].mean().item(), base_itr+i)
+                    wandb_logger.add_scalar('lambda/std_itr', mixed_lam[0].std().item(), base_itr+i)
+                    wandb_logger.add_scalar('train/prob_mix', prob_mix, base_itr+i)
 
         # for manifold mixup
         elif args.train == 'mixup_hidden':
@@ -474,7 +529,18 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
             raise AssertionError('wrong train type!!')
 
         # measure accuracy and record loss
-        prec1, prec5 = accuracy(output, target, topk=(1, 5))
+        if args.train == 'ours':
+            if prob_mix == 0:
+                prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            elif prob_mix ==1:
+                prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+            else:
+                prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+                prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
+                prec1 = prec1_mix + prec1_std
+                prec5 = prec5_mix + prec5_std
+        else:
+            prec1, prec5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
         top5.update(prec5.item(), input.size(0))
@@ -497,7 +563,6 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
         '  **Train** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'.format(
             top1=top1, top5=top5, error1=100 - top1.avg), log)
     return top1.avg, top5.avg, losses.avg
-
 
 def validate(val_loader, model, log, fgsm=False, eps=4, rand_init=False, mean=None, std=None):
     '''evaluate trained model'''
@@ -729,7 +794,9 @@ def main():
                 'optimizer': optimizer.state_dict(),
             }, is_best, exp_dir, 'checkpoint.pth.tar')
 
-        saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
+        # checkpoint every epoch if training tiny-imagenet, or every 10 epochs otherwise
+        if args.dataset == 'tiny-imagenet-200' or (epoch+1) % 10 == 0:
+            saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
 
         dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc)
         if (epoch + 1) % 100 == 0:
