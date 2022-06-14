@@ -8,6 +8,7 @@ cmd=$4
 hdd=/scratch/hdd001/home/$USER
 ssd=/scratch/ssd001/home/$USER
 j_dir=$hdd/mixup/$d/$j_name
+#j_dir=$ssd/workspace/ama-at-vector/best-mix/exp/$d/$j_name
 
 mkdir -p $j_dir/scripts
 

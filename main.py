@@ -23,7 +23,8 @@ from multiprocessing import Pool
 import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
-from utils_mixup import gradmix, reweighted_lam
+from utils_mixup import gradmix, reweighted_lam, gradmix_v2
+from mixup import to_one_hot
 
 model_names = sorted(
     name for name in models.__dict__
@@ -78,6 +79,11 @@ parser.add_argument('--initial_channels', type=int, default=64, choices=(16, 64)
 
 # Optimization options
 parser.add_argument('--epochs', type=int, default=300, help='number of epochs to train')
+parser.add_argument('--method',
+                    type=str,
+                    default='vanilla',
+                    choices=['vanilla', 'mixup', 'cutmix','manifold','puzzle','ours'],
+                    help='use an unified param to help specify training params')
 parser.add_argument('--train',
                     type=str,
                     default='vanilla',
@@ -178,7 +184,15 @@ parser.add_argument("--blur_sigma", default=1.0, type=float)
 parser.add_argument("--kernel_size", default=5, type=int)
 parser.add_argument('--eval_mode', default=False)
 parser.add_argument("--grad_normalization", default=0, type=int)
-parser.add_argument('--use_yp_argmax', default=False)
+# parser.add_argument('--use_yp_argmax', default=False)
+# parser.add_argument('--new_implementation', default=False)
+# parser.add_argument('--with_shift', default=False)
+
+parser.add_argument('--new_implementation', type=str2bool, default=True)
+parser.add_argument('--with_shift', type=str2bool, default=True)
+parser.add_argument('--use_yp_argmax', type=str2bool, default=True)
+parser.add_argument("--mix_stride", default=1, type=int)
+
 
 parser.add_argument("--prob_mix", default=1.0, type=float)
 parser.add_argument("--mix_schedule", default='fixed', choices=['fixed','scheduled','delayed'])
@@ -346,12 +360,6 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
     mixing_avg = []
     prob_mix = get_prob_mix(args.mix_schedule, args.prob_mix, epoch, args.mix_scheduled_epoch)
 
-
-    try:
-        base_itr = int(train_loader.dataset.data.shape[0]/train_loader.batch_size)*epoch
-    except AttributeError:
-        base_itr = int(len(train_loader.dataset.imgs)/train_loader.batch_size*epoch)
-    
     if args.blur_sigma != 0.:
         blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
 
@@ -379,69 +387,100 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
         # train with mixup images
         elif args.train == 'mixup':
-            # process for Puzzle Mix
-            if args.graph:
-                # whether to add adversarial noise or not
-                if args.adv_p > 0:
-                    adv_mask1 = np.random.binomial(n=1, p=args.adv_p)
-                    adv_mask2 = np.random.binomial(n=1, p=args.adv_p)
+
+            batch_size = input.shape[0]
+            mix_size = int(batch_size*prob_mix)
+
+            # if mix_size is 0, we are simply doing standard training with no DA
+            if mix_size == 0:
+                input_var, target_var = Variable(input), Variable(target)
+                output, reweighted_target = model(input_var, target_var)
+
+                loss = bce_loss(softmax(output), reweighted_target)
+            else:
+                if mix_size == batch_size:
+                    # entire batch is DA
+                    input_2b_mixed = input
+                    target_2b_mixed = target
+                    input_std = None
+                    target_std = None
                 else:
-                    adv_mask1 = 0
-                    adv_mask2 = 0
+                    # some inputs are augmented, some are not
+                    input_std, input_2b_mixed = input[:(batch_size-mix_size)], input[(batch_size-mix_size):]
+                    target_std, target_2b_mixed = target[:(batch_size-mix_size)], target[(batch_size-mix_size):]
 
-                # random start
-                if (adv_mask1 == 1 or adv_mask2 == 1):
-                    noise = torch.zeros_like(input).uniform_(-args.adv_eps / 255.,
-                                                             args.adv_eps / 255.)
-                    input_orig = input * args.std + args.mean
-                    input_noise = input_orig + noise
-                    input_noise = torch.clamp(input_noise, 0, 1)
-                    noise = input_noise - input_orig
-                    input_noise = (input_noise - args.mean) / args.std
-                    input_var = Variable(input_noise, requires_grad=True)
+                # process for Puzzle Mix
+                if args.graph:
+                    # whether to add adversarial noise or not
+                    if args.adv_p > 0:
+                        adv_mask1 = np.random.binomial(n=1, p=args.adv_p)
+                        adv_mask2 = np.random.binomial(n=1, p=args.adv_p)
+                    else:
+                        adv_mask1 = 0
+                        adv_mask2 = 0
+
+                    # random start:
+                    if (adv_mask1 == 1 or adv_mask2 == 1):
+                        noise = torch.zeros_like(input_2b_mixed).uniform_(-args.adv_eps / 255.,
+                                                                 args.adv_eps / 255.)
+                        input_2b_mixed_orig = input_2b_mixed * args.std + args.mean
+                        input_2b_mixed_noise = input_2b_mixed_orig + noise
+                        input_2b_mixed_noise = torch.clamp(input_2b_mixed_noise, 0, 1)
+                        noise = input_2b_mixed_noise - input_2b_mixed_orig
+                        input_2b_mixed_noise = (input_2b_mixed_noise - args.mean) / args.std
+                        input_2b_mixed_var = Variable(input_2b_mixed_noise, requires_grad=True)
+                    else:
+                        input_2b_mixed_var = Variable(input_2b_mixed, requires_grad=True)
+                    target_2b_mixed_var = Variable(target_2b_mixed)
+
+                    # calculate saliency (unary)
+                    if args.clean_lam == 0:
+                        model.eval()
+                        output_mix = model(input_2b_mixed_var)
+                        loss_batch = criterion_batch(output_mix, target_2b_mixed_var)
+                    else:
+                        model.train()
+                        output_mix = model(input_2b_mixed_var)
+                        loss_batch = 2 * args.clean_lam * criterion_batch(output_mix,
+                                                                          target_2b_mixed_var) / args.num_classes
+
+                    loss_batch_mean = torch.mean(loss_batch, dim=0)
+                    loss_batch_mean.backward(retain_graph=True)
+
+                    unary = torch.sqrt(torch.mean(input_2b_mixed_var.grad**2, dim=1))
+
+                    # calculate adversarial noise
+                    if (adv_mask1 == 1 or adv_mask2 == 1):
+                        noise += (args.adv_eps + 2) / 255. * input_2b_mixed_var.grad.sign()
+                        noise = torch.clamp(noise, -args.adv_eps / 255., args.adv_eps / 255.)
+                        adv_mix_coef = np.random.uniform(0, 1)
+                        noise = adv_mix_coef * noise
+
+                    if args.clean_lam == 0:
+                        model.train()
+                        optimizer.zero_grad()
+
+                input_2b_mixed_var, target_2b_mixed_var = Variable(input_2b_mixed), Variable(target_2b_mixed)
+                output_mix, reweighted_target = model(input_2b_mixed_var,
+                                                      target_2b_mixed_var,
+                                                      mixup=True,
+                                                      args=args,
+                                                      grad=unary,
+                                                      noise=noise,
+                                                      adv_mask1=adv_mask1,
+                                                      adv_mask2=adv_mask2,
+                                                      mp=mp)
+                if input_std is None:
+                    # perform mixup and calculate loss
+                    loss = bce_loss(softmax(output_mix), reweighted_target)
                 else:
-                    input_var = Variable(input, requires_grad=True)
-                target_var = Variable(target)
+                    loss_mix = bce_loss_sum(softmax(output_mix), reweighted_target)
 
-                # calculate saliency (unary)
-                if args.clean_lam == 0:
-                    model.eval()
-                    output = model(input_var)
-                    loss_batch = criterion_batch(output, target_var)
-                else:
-                    model.train()
-                    output = model(input_var)
-                    loss_batch = 2 * args.clean_lam * criterion_batch(output,
-                                                                      target_var) / args.num_classes
+                    input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                    output_std, reweighted_target_std = model(input_std_var, target_std_var)
 
-                loss_batch_mean = torch.mean(loss_batch, dim=0)
-                loss_batch_mean.backward(retain_graph=True)
-
-                unary = torch.sqrt(torch.mean(input_var.grad**2, dim=1))
-
-                # calculate adversarial noise
-                if (adv_mask1 == 1 or adv_mask2 == 1):
-                    noise += (args.adv_eps + 2) / 255. * input_var.grad.sign()
-                    noise = torch.clamp(noise, -args.adv_eps / 255., args.adv_eps / 255.)
-                    adv_mix_coef = np.random.uniform(0, 1)
-                    noise = adv_mix_coef * noise
-
-                if args.clean_lam == 0:
-                    model.train()
-                    optimizer.zero_grad()
-
-            input_var, target_var = Variable(input), Variable(target)
-            # perform mixup and calculate loss
-            output, reweighted_target = model(input_var,
-                                              target_var,
-                                              mixup=True,
-                                              args=args,
-                                              grad=unary,
-                                              noise=noise,
-                                              adv_mask1=adv_mask1,
-                                              adv_mask2=adv_mask2,
-                                              mp=mp)
-            loss = bce_loss(softmax(output), reweighted_target)
+                    loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
+                    loss = (loss_std+loss_mix)/batch_size/args.num_classes
 
         # integrating our method :AVery
         elif args.train == 'ours':
@@ -453,6 +492,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
             if mix_size == 0:
                 input_var, target_var = Variable(input), Variable(target)
                 output, reweighted_target = model(input_var, target_var)
+
                 loss = bce_loss(softmax(output), reweighted_target)
             else:
                 if mix_size == batch_size:
@@ -493,63 +533,134 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
                     g_tilde = blurrer(g)
 
-                if args.grad_normalization==1:
-                    g_tilde = g_tilde/torch.norm(g_tilde,p=2,dim=[1,2,3],keepdim=True)
-                elif args.grad_normalization==2:
-                    g_tilde = g_tilde/g_tilde.sum(dim=[1,2,3],keepdim=True)
-                elif args.grad_normalization==3:
-                    g_tilde = g_tilde-g_tilde.amin(dim=[1,2,3],keepdim=True)
-                    g_tilde = (g_tilde/g_tilde.amax(dim=[1,2,3],keepdim=True)).clamp(min=1e-6)
+                # if args.grad_normalization==1:
+                    # g_tilde = g_tilde/torch.norm(g_tilde,p=2,dim=[1,2,3],keepdim=True)
+                # elif args.grad_normalization==2:
+                    # g_tilde = g_tilde/g_tilde.sum(dim=[1,2,3],keepdim=True)
+                # elif args.grad_normalization==3:
+                    # g_tilde = g_tilde-g_tilde.amin(dim=[1,2,3],keepdim=True)
+                    # g_tilde = (g_tilde/g_tilde.amax(dim=[1,2,3],keepdim=True)).clamp(min=1e-6)
 
-                mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var, target_2b_mixed_var, g_tilde)
-                reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
-
+                if args.with_shift:
+                    mixed_x, mixed_y, mixed_lam = gradmix_v2(input_2b_mixed_var, target_2b_mixed_var, g_tilde, stride=args.mix_stride)
+                else:
+                    mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var, target_2b_mixed_var, g_tilde)
+                    
                 optimizer.zero_grad()
 
-                # perform mixup and calculate loss
-                output_mix = model(mixed_x)
-                loss = bce_loss(softmax(output_mix), reweighted_target)
+                if args.new_implementation:
+                    reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
 
-                if input_std is not None:
-                    input_std_var, target_std_var = Variable(input_std), Variable(target_std)
-                    output_std, reweighted_target_std = model(input_std_var, target_std_var)
-                    loss += bce_loss(softmax(output_std), reweighted_target_std)
+                    if input_std is None:
+                        output_mix = model(mixed_x)
+                        loss = bce_loss(softmax(output_mix), reweighted_target_mix)
+                    else:
+                        input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                        input_concat = torch.cat([mixed_x, input_std_var], dim=0)
 
-                if args.enable_wandb:
-                    wandb_logger.add_scalar('lambda/mean_itr', mixed_lam[0].mean().item(), base_itr+i)
-                    wandb_logger.add_scalar('lambda/std_itr', mixed_lam[0].std().item(), base_itr+i)
-                    wandb_logger.add_scalar('train/prob_mix', prob_mix, base_itr+i)
+                        output_mix = model(input_concat)
+
+                        reweighted_target_std = to_one_hot(target_std_var, args.num_classes)
+                        reweighted_target_concat = torch.cat([reweighted_target_mix, reweighted_target_std],dim=0)
+
+                        target_concat = torch.cat([target_2b_mixed, target_std], dim=0)
+
+                        loss = bce_loss(softmax(output_mix), reweighted_target_concat)
+                else:
+                    # perform mixup and calculate loss
+                    reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+                    output_mix = model(mixed_x)
+                    if input_std is None:
+                        loss = bce_loss(softmax(output_mix), reweighted_target)
+                    else:
+                        loss_mix = bce_loss_sum(softmax(output_mix), reweighted_target)
+
+                        input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                        output_std, reweighted_target_std = model(input_std_var, target_std_var)
+
+                        loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
+
+                        loss = (loss_std+loss_mix)/batch_size/args.num_classes
+                    
+    ########
 
         # for manifold mixup
         elif args.train == 'mixup_hidden':
-            input_var, target_var = Variable(input), Variable(target)
-            output, reweighted_target = model(input_var, target_var, mixup_hidden=True, args=args)
-            loss = bce_loss(softmax(output), reweighted_target)
+            batch_size = input.shape[0]
+            mix_size = int(batch_size*prob_mix)
+
+            # if mix_size is 0, we are simply doing standard training with no DA
+            if mix_size == 0:
+                input_var, target_var = Variable(input), Variable(target)
+                if args.arch == 'resnext29_4_24':
+                    output = model(input_var)
+                    reweighted_target = to_one_hot(target_var, args.num_classes)
+                else:
+                    output, reweighted_target = model(input_var, target_var)
+
+                loss = bce_loss(softmax(output), reweighted_target)
+            else:
+                if mix_size == batch_size:
+                    # entire batch is DA
+                    input_2b_mixed = input
+                    target_2b_mixed = target
+                    input_std = None
+                    target_std = None
+                else:
+                    # some inputs are augmented, some are not
+                    input_std, input_2b_mixed = input[:(batch_size-mix_size)], input[(batch_size-mix_size):]
+                    target_std, target_2b_mixed = target[:(batch_size-mix_size)], target[(batch_size-mix_size):]
+
+                input_2b_mixed_var, target_2b_mixed_var = Variable(input_2b_mixed), Variable(target_2b_mixed)
+                output_mix, reweighted_target = model(input_2b_mixed_var, target_2b_mixed_var, mixup_hidden=True, args=args)
+
+                if input_std is None:
+                    # perform mixup and calculate loss
+                    loss = bce_loss(softmax(output_mix), reweighted_target)
+                else:
+                    loss_mix = bce_loss_sum(softmax(output_mix), reweighted_target)
+
+                    input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                    if args.arch == 'resnext29_4_24':
+                        output_std = model(input_std_var)
+                        reweighted_target_std = to_one_hot(target_std_var, args.num_classes)
+                    else:
+                        output_std, reweighted_target_std = model(input_std_var, target_std_var)
+
+                    loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
+                    loss = (loss_std+loss_mix)/batch_size/args.num_classes
         else:
             raise AssertionError('wrong train type!!')
 
         # measure accuracy and record loss
-        if args.train == 'ours':
-            if prob_mix == 0:
+        if args.train in ['mixup', 'mixup_hidden']:
+            if mix_size == 0:
                 prec1, prec5 = accuracy(output, target, topk=(1, 5))
-            elif prob_mix ==1:
-                prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+            elif mix_size == batch_size:
+                prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
             else:
                 prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
                 prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
                 prec1 = prec1_mix + prec1_std
                 prec5 = prec5_mix + prec5_std
-        else:
+        elif args.train == 'ours':
+            if mix_size == 0:
+                prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            elif mix_size == batch_size:
+                prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+            else:
+                if args.new_implementation:
+                    prec1, prec5 = accuracy(output_mix, target_concat, topk=(1, 5))
+                else:
+                    prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+                    prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
+                    prec1 = prec1_mix + prec1_std
+                    prec5 = prec5_mix + prec5_std
+        elif args.train == 'vanilla':
             prec1, prec5 = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
         top5.update(prec5.item(), input.size(0))
-
-        if args.enable_wandb:
-            wandb_logger.add_scalar('train/loss_itr', loss.item(), base_itr+i)
-            wandb_logger.add_scalar('train/top1_itr', prec1.item(), base_itr+i)
-            wandb_logger.add_scalar('train/top5_itr', prec5.item(), base_itr+i)
-            wandb_logger.add_scalar('train/error1_itr', 100-prec1.item(), base_itr+i)
 
         # compute gradient and do SGD step
         loss.backward()
@@ -621,6 +732,7 @@ best_acc = 0
 
 
 def main():
+
     # set up the experiment directories
     if not args.log_off:
         exp_name = experiment_name_non_mnist()
@@ -651,7 +763,7 @@ def main():
     # dataloader
     train_loader, valid_loader, _, test_loader, num_classes = load_data_subset(
         args.batch_size,
-        2,
+        args.workers,
         args.dataset,
         args.data_dir,
         labels_per_class=args.labels_per_class,
@@ -682,7 +794,13 @@ def main():
 
     # create model
     print_log("=> creating model '{}'".format(args.arch), log)
-    net = models.__dict__[args.arch](num_classes, args.dropout, stride).cuda()
+    if args.arch == 'resnext29_4_24' and args.train != 'ours':
+        print_log("use my implementation of resnext", log)
+        my_implementation = 'resnext29_4_24_new'
+        net = models.__dict__[my_implementation](num_classes, args.dropout, stride).cuda()
+    else:
+        net = models.__dict__[args.arch](num_classes, args.dropout, stride).cuda()
+
     args.num_classes = num_classes
 
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
@@ -784,18 +902,22 @@ def main():
         if args.log_off:
             continue
 
-        # save log
-        save_checkpoint(
-            {
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': net.state_dict(),
-                'recorder': recorder,
-                'optimizer': optimizer.state_dict(),
-            }, is_best, exp_dir, 'checkpoint.pth.tar')
+        # save log:
+        if args.dataset != 'tiny-imagenet-200' or epoch == args.epochs:
+            # for both cifar10/cifar100, we do 300 epochs training,
+            # to save training time, we only start saving after 150 epochs
+            if epoch > 150 and is_best:
+                save_checkpoint(
+                    {
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': net.state_dict(),
+                        'recorder': recorder,
+                        'optimizer': optimizer.state_dict(),
+                    }, is_best, exp_dir, 'checkpoint.pth.tar')
 
-        # checkpoint every epoch if training tiny-imagenet, or every 10 epochs otherwise
-        if args.dataset == 'tiny-imagenet-200' or (epoch+1) % 10 == 0:
+        # checkpoint every epoch every 10 epochs otherwise
+        if epoch+1 % 10 == 0:
             saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
 
         dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc)

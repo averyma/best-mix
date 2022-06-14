@@ -10,4 +10,4 @@ You can construct a model with random weights by calling its constructor:
 
 from .preresnet import preactresnet18, preactresnet34, preactresnet50, preactresnet101, preactresnet152
 from .wide_resnet import wrn28_10, wrn28_2, wrn16_8
-from .resnext import resnext29_4_24
+from .resnext import resnext29_4_24, resnext29_4_24_new

@@ -22,7 +22,9 @@ class wandbLogger(object):
 
         self.wandb_log = wandb.init(name=args.job_name,
                                     project=args.wandb_project,
-                                    dir=args.root_dir)
+                                    dir=args.root_dir,
+                                    resume='allow',
+                                    id=str(args.job_id))
         self.wandb_log.config.update(args)
 
     def add_scalar(self, name, val, step):
