@@ -1,5 +1,5 @@
 #!/bin/bash
-wandb_project='mixup-baseline-new'
+wandb_project='mixup-baseline-June'
 #wandb_project='test'
 gpu="t4v1,p100,t4v2,rtx6000"
 #gpu="t4v1,p100,t4v2"
@@ -43,44 +43,18 @@ lr=0.2
 #for arch in 'resnext29_4_24';do
 #for arch in 'wrn16_8';do
 for arch in 'preactresnet18';do
-	#vanilla
-	#for seed in 0 1 2; do
-		#j_name=$RANDOM
-		#bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --train vanilla --ngpu ${ngpu} --workers ${workers}"
-		#sleep 0.5
-	#done
+	for seed in 0 1 2; do
+		j_name=$RANDOM$RANDOM
+		bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --method vanilla --ngpu ${ngpu} --workers ${workers}"
+		sleep 0.5
 
-	#for prob_mix in 1.0 0.7; do
-	#for prob_mix in 0.7; do
-	for prob_mix in 1.0; do
-		#input mixup
-		#for seed in 0 1 2; do
-			#j_name=$RANDOM
-			#bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --train mixup --mixup_alpha 1.0 --ngpu ${ngpu} --workers ${workers} --prob_mix ${prob_mix}"
-			#sleep 0.5
-		#done
-
-		#manifold mixup
-		#for seed in 0; do
-		for seed in 0 1 2; do
-			j_name=$RANDOM
-			bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --train mixup_hidden --mixup_alpha 2.0 --ngpu ${ngpu} --workers ${workers} --prob_mix ${prob_mix}"
-			sleep 0.5
+		for method in 'vanilla' 'input' 'manifold' 'cutmix' 'puzzle'; do
+			for prob_mix in 0.7 1.0; do
+				j_name=$RANDOM$RANDOM
+				bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --method ${method} --ngpu ${ngpu} --workers ${workers} --prob_mix ${prob_mix}"
+				sleep 0.5
+			done
 		done
-
-		#cutmix
-		#for seed in 0 1 2; do
-			#j_name=$RANDOM
-			#bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --train mixup --box True --mixup_alpha 1.0 --ngpu ${ngpu} --workers ${workers} --prob_mix ${prob_mix}"
-			#sleep 0.5
-		#done
-
-		#puzzle
-		#for seed in 0 1 2; do
-			#j_name=$RANDOM
-			#bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001  --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --train mixup --graph True --mixup_alpha 1.0 --n_labels 3 --eta 0.2 --beta 1.2 --gamma 0.5 --neigh_size 4 --transport True --t_size 4 --t_eps 0.8 --ngpu ${ngpu} --workers ${workers} --prob_mix ${prob_mix}"
-			#sleep 0.5
-		#done
 	done
 done
 

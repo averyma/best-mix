@@ -17,3 +17,4 @@ figures/.DS_Store
 imagenet/checkpoint/*
 !notebook/*
 !notebook/*.ipynb
+notebook/.ipynb_checkpoints/

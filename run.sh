@@ -1,5 +1,5 @@
 #!/bin/bash
-wandb_project='ours-with-shift'
+wandb_project='ours-with-shift-v2'
 #wandb_project='mixup-baseline'
 #wandb_project='ours-best-old-setup'
 #wandb_project='ours-cifar100-resnext29-4-24'
@@ -54,20 +54,20 @@ lr=0.2
 
 #prob_mix=0.7
 #blur_sigma=1.75
-eval_mode=0
+#eval_mode=0
 use_yp_argmax=0
 
 #with_shift=1
-mix_stride=4
+mix_stride=1
 
 for prob_mix in 1.0 0.7; do
-	for new_imp in 0 1; do
+	for new_imp in 1 0; do
 		for eval_mode in 0 1; do
 			for with_shift in 1 0; do
 				for seed in 0 1 2 ; do
-					for blur_sigma in 1.5 2.0 2.5 3.0; do
+					for blur_sigma in 1.0 1.5 2.0 2.5 100; do
 						j_name=$RANDOM$RANDOM
-						bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001 --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --train ours  --use_yp_argmax ${use_yp_argmax} --blur_sigma ${blur_sigma} --eval_mode ${eval_mode} --grad_normalization ${grad_normalization} --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --kernel_size ${kernel_size} --prob_mix ${prob_mix} --mix_schedule ${mix_schedule} --mix_scheduled_epoch ${mix_scheduled_epoch} --ngpu ${ngpu} --workers ${workers} --new_implementation ${new_imp} --with_shift ${with_shift} --mix_stride ${mix_stride}"
+						bash launch_slurm_job.sh ${gpu} ${j_name} ${ngpu} "python3 main.py --dataset ${dataset} --data_dir ${data_dir} --labels_per_class ${labels_per_class} --arch ${arch}  --learning_rate ${lr} --momentum 0.9 --decay 0.0001 --epochs ${epochs} --schedule ${decay_1} ${decay_2} --gammas 0.1 0.1 --method ours  --use_yp_argmax ${use_yp_argmax} --blur_sigma ${blur_sigma} --eval_mode ${eval_mode} --grad_normalization ${grad_normalization} --seed ${seed} --job_name ${j_name} --wandb_project ${wandb_project} --enable_wandb 1 --kernel_size ${kernel_size} --prob_mix ${prob_mix} --mix_schedule ${mix_schedule} --mix_scheduled_epoch ${mix_scheduled_epoch} --ngpu ${ngpu} --workers ${workers} --new_implementation ${new_imp} --with_shift ${with_shift} --mix_stride ${mix_stride}"
 						sleep 0.5
 					done
 				done

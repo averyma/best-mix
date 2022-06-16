@@ -23,6 +23,7 @@ from multiprocessing import Pool
 import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
+import torchvision.transforms as transforms
 from utils_mixup import gradmix, reweighted_lam, gradmix_v2
 from mixup import to_one_hot
 
@@ -82,7 +83,7 @@ parser.add_argument('--epochs', type=int, default=300, help='number of epochs to
 parser.add_argument('--method',
                     type=str,
                     default='vanilla',
-                    choices=['vanilla', 'mixup', 'cutmix','manifold','puzzle','ours'],
+                    choices=['vanilla', 'input', 'cutmix', 'manifold', 'puzzle', 'ours'],
                     help='use an unified param to help specify training params')
 parser.add_argument('--train',
                     type=str,
@@ -193,7 +194,6 @@ parser.add_argument('--with_shift', type=str2bool, default=True)
 parser.add_argument('--use_yp_argmax', type=str2bool, default=True)
 parser.add_argument("--mix_stride", default=1, type=int)
 
-
 parser.add_argument("--prob_mix", default=1.0, type=float)
 parser.add_argument("--mix_schedule", default='fixed', choices=['fixed','scheduled','delayed'])
 parser.add_argument("--mix_scheduled_epoch", default=300, type=int)
@@ -212,6 +212,33 @@ cudnn.benchmark = True
 
 if args.enable_wandb:
     wandb_logger = wandbLogger(args)
+
+if args.method == 'vanilla':
+    args.train = 'vanilla'
+elif args.method == 'input':
+    args.train = 'mixup'
+    args.mixup_alpha = 1.0
+elif args.method == 'manifold':
+    args.train = 'mixup_hidden'
+    args.mixup_alpha = 2.0
+elif args.method == 'cutmix':
+    args.train = 'mixup'
+    args.box = True
+    args.mixup_alpha = 1.0
+elif args.method == 'puzzle':
+    args.train = 'mixup'
+    args.graph = True
+    args.mixup_alpha = 1.0
+    args.n_labels = 3
+    args.eta = 0.2
+    args.beta = 1.2
+    args.gamma = 0.5
+    args.neigh_size = 4
+    args.transport = True
+    args.t_size = 4
+    args.t_eps = 0.8
+elif args.method == 'ours':
+    args.train == 'ours'
 
 def experiment_name_non_mnist(dataset=args.dataset,
                               arch=args.arch,
@@ -360,8 +387,9 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
     mixing_avg = []
     prob_mix = get_prob_mix(args.mix_schedule, args.prob_mix, epoch, args.mix_scheduled_epoch)
 
-    if args.blur_sigma != 0.:
-        blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
+    # if args.blur_sigma != 0.:
+        # blurrer = GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
+                                 # sigma=(args.blur_sigma, args.blur_sigma))
 
     # switch to train mode
     model.train()
@@ -526,11 +554,16 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
                 model.train()
 
-                g = input_2b_mixed_var.grad.data.abs().mean(dim=1,keepdim=True).detach()
+                g = input_2b_mixed_var.grad.data.abs().mean(dim=1, keepdim=True).detach()
 
                 # apply gaussian bluring to the gradients
                 if args.blur_sigma != 0.:
-                    blurrer = torchvision.transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size), sigma=(args.blur_sigma, args.blur_sigma))
+                    if args.blur_sigma == 100:
+                        _blur_sigma = np.random.uniform(low=1.0, high=2.5)
+                    else:
+                        _blur_sigma = args.blur_sigma
+                    blurrer = transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
+                                                      sigma=(_blur_sigma, _blur_sigma))
                     g_tilde = blurrer(g)
 
                 # if args.grad_normalization==1:
@@ -542,10 +575,16 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     # g_tilde = (g_tilde/g_tilde.amax(dim=[1,2,3],keepdim=True)).clamp(min=1e-6)
 
                 if args.with_shift:
-                    mixed_x, mixed_y, mixed_lam = gradmix_v2(input_2b_mixed_var, target_2b_mixed_var, g_tilde, stride=args.mix_stride)
+                    mixed_x, mixed_y, mixed_lam = gradmix_v2(input_2b_mixed_var,
+                                                             target_2b_mixed_var,
+                                                             g_tilde,
+                                                             stride=args.mix_stride,
+                                                             debug=False)
                 else:
-                    mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var, target_2b_mixed_var, g_tilde)
-                    
+                    mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var,
+                                                          target_2b_mixed_var,
+                                                          g_tilde)
+
                 optimizer.zero_grad()
 
                 if args.new_implementation:
@@ -561,7 +600,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                         output_mix = model(input_concat)
 
                         reweighted_target_std = to_one_hot(target_std_var, args.num_classes)
-                        reweighted_target_concat = torch.cat([reweighted_target_mix, reweighted_target_std],dim=0)
+                        reweighted_target_concat = torch.cat([reweighted_target_mix, reweighted_target_std], dim=0)
 
                         target_concat = torch.cat([target_2b_mixed, target_std], dim=0)
 
@@ -581,7 +620,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                         loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
 
                         loss = (loss_std+loss_mix)/batch_size/args.num_classes
-                    
+
     ########
 
         # for manifold mixup
