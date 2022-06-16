@@ -15,4 +15,5 @@ saliency.py
 figures/.DS_Store
 !imagenet/*
 imagenet/checkpoint/*
-
+!notebook/*
+!notebook/*.ipynb
