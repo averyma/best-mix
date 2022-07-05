@@ -27,10 +27,10 @@ class wandbLogger(object):
                                     id=str(args.job_id))
         self.wandb_log.config.update(args)
 
-    def add_scalar(self, name, val, step):
+    def add_scalar(self, name, val, step, commit=True):
         # self.writer.add_scalar(name, val, step)
 
         if "_itr" in name:
-            self.wandb_log.log({"iteration": step, name: float(val)})
+            self.wandb_log.log({"iteration": step, name: float(val)}, commit=commit)
         else:
-            self.wandb_log.log({"epoch": step, name: float(val)})
+            self.wandb_log.log({"epoch": step, name: float(val)}, commit=commit)

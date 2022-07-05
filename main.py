@@ -24,8 +24,8 @@ import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
 import torchvision.transforms as transforms
-from utils_mixup import gradmix, reweighted_lam, gradmix_v2
-from mixup import to_one_hot
+from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved
+from mixup import to_one_hot, get_lambda
 
 model_names = sorted(
     name for name in models.__dict__
@@ -183,20 +183,28 @@ parser.add_argument("--wandb_project", default='test')
 parser.add_argument("--job_name", default='test')
 parser.add_argument("--blur_sigma", default=1.0, type=float)
 parser.add_argument("--kernel_size", default=5, type=int)
-parser.add_argument('--eval_mode', default=False)
-parser.add_argument("--grad_normalization", default=0, type=int)
-# parser.add_argument('--use_yp_argmax', default=False)
-# parser.add_argument('--new_implementation', default=False)
-# parser.add_argument('--with_shift', default=False)
 
+parser.add_argument('--grad_normalization',
+                    type=str,
+                    default='standard',
+                    choices=['standard', 'L1'],
+                    help='normalize the saliency mask before mixing')
+
+parser.add_argument('--eval_mode', type=str2bool, default=False)
 parser.add_argument('--new_implementation', type=str2bool, default=True)
 parser.add_argument('--with_shift', type=str2bool, default=True)
-parser.add_argument('--use_yp_argmax', type=str2bool, default=True)
+parser.add_argument('--use_yp_argmax', type=str2bool, default=False)
+
 parser.add_argument("--mix_stride", default=1, type=int)
+parser.add_argument("--rand_pos", default=0, type=int)
+# parser.add_argument('--test_param', default=False)
 
 parser.add_argument("--prob_mix", default=1.0, type=float)
 parser.add_argument("--mix_schedule", default='fixed', choices=['fixed','scheduled','delayed'])
 parser.add_argument("--mix_scheduled_epoch", default=300, type=int)
+
+parser.add_argument("--upper_lambda", default=1.0, type=float)
+parser.add_argument("--mixup_alpha2", default=0., type=float)
 
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
@@ -210,21 +218,27 @@ torch.cuda.manual_seed_all(args.seed)
 
 cudnn.benchmark = True
 
-if args.enable_wandb:
-    wandb_logger = wandbLogger(args)
-
 if args.method == 'vanilla':
     args.train = 'vanilla'
 elif args.method == 'input':
     args.train = 'mixup'
-    args.mixup_alpha = 1.0
+    if args.dataset in ['cifar10', 'cifar100']:
+        args.mixup_alpha = 1.0
+    else:
+        args.mixup_alpha = 0.2
 elif args.method == 'manifold':
     args.train = 'mixup_hidden'
-    args.mixup_alpha = 2.0
+    if args.dataset in ['cifar10', 'cifar100']:
+        args.mixup_alpha = 2.0
+    else:
+        args.mixup_alpha = 0.2
 elif args.method == 'cutmix':
     args.train = 'mixup'
     args.box = True
-    args.mixup_alpha = 1.0
+    if args.dataset in ['cifar10', 'cifar100']:
+        args.mixup_alpha = 1.0
+    else:
+        args.mixup_alpha = 0.2
 elif args.method == 'puzzle':
     args.train = 'mixup'
     args.graph = True
@@ -235,10 +249,16 @@ elif args.method == 'puzzle':
     args.gamma = 0.5
     args.neigh_size = 4
     args.transport = True
-    args.t_size = 4
+    if args.dataset in ['cifar10', 'cifar100']:
+        args.t_size = 4
     args.t_eps = 0.8
+    if args.dataset == 'tiny-imagenet-200':
+        args.clean_lam = 1
 elif args.method == 'ours':
-    args.train == 'ours'
+    args.train = 'ours'
+
+if args.enable_wandb:
+    wandb_logger = wandbLogger(args)
 
 def experiment_name_non_mnist(dataset=args.dataset,
                               arch=args.arch,
@@ -387,9 +407,9 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
     mixing_avg = []
     prob_mix = get_prob_mix(args.mix_schedule, args.prob_mix, epoch, args.mix_scheduled_epoch)
 
-    # if args.blur_sigma != 0.:
-        # blurrer = GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
-                                 # sigma=(args.blur_sigma, args.blur_sigma))
+    if args.method == 'ours' and args.blur_sigma != 100:
+        blurrer = transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
+                                          sigma=(args.blur_sigma, args.blur_sigma))
 
     # switch to train mode
     model.train()
@@ -544,6 +564,11 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     model.train()
                 output = model(input_2b_mixed_var)
 
+                # if args.test_param:
+                    # print('fuck...its True')
+                # else:
+                    # print('hmm...false')
+
                 if args.use_yp_argmax:
                     loss_batch = criterion_batch(output, output.argmax(dim=1))
                 else:
@@ -557,34 +582,47 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                 g = input_2b_mixed_var.grad.data.abs().mean(dim=1, keepdim=True).detach()
 
                 # apply gaussian bluring to the gradients
-                if args.blur_sigma != 0.:
-                    if args.blur_sigma == 100:
-                        _blur_sigma = np.random.uniform(low=1.0, high=2.5)
+                if args.blur_sigma == 100:
+                    if args.dataset == 'tiny-imagenet-200':
+                        _blur_sigma = np.random.uniform(low=2.0, high=3.0)
                     else:
-                        _blur_sigma = args.blur_sigma
+                        _blur_sigma = np.random.uniform(low=1.0, high=2.0)
                     blurrer = transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
                                                       sigma=(_blur_sigma, _blur_sigma))
-                    g_tilde = blurrer(g)
-
-                # if args.grad_normalization==1:
-                    # g_tilde = g_tilde/torch.norm(g_tilde,p=2,dim=[1,2,3],keepdim=True)
-                # elif args.grad_normalization==2:
-                    # g_tilde = g_tilde/g_tilde.sum(dim=[1,2,3],keepdim=True)
-                # elif args.grad_normalization==3:
-                    # g_tilde = g_tilde-g_tilde.amin(dim=[1,2,3],keepdim=True)
-                    # g_tilde = (g_tilde/g_tilde.amax(dim=[1,2,3],keepdim=True)).clamp(min=1e-6)
+                g_tilde = blurrer(g)
 
                 if args.with_shift:
-                    mixed_x, mixed_y, mixed_lam = gradmix_v2(input_2b_mixed_var,
-                                                             target_2b_mixed_var,
-                                                             g_tilde,
-                                                             stride=args.mix_stride,
-                                                             debug=False)
+                    if args.mixup_alpha2 == 0.:
+                        if args.mixup_alpha == 0.:
+                            sampled_alpha = 0.5
+                        else:
+                            sampled_alpha = get_lambda(args.mixup_alpha)
+                        sampled_alpha *= args.upper_lambda
+                    else:
+                        sampled_alpha = get_lambda(args.mixup_alpha, args.mixup_alpha2)
+                    
+                    # if args.arch == 'resnext29_4_24' or args.dataset == 'tiny-imagenet-200':
+                    mixed_x, mixed_y, mixed_lam = gradmix_v2_improved(input_2b_mixed_var,
+                                                                     target_2b_mixed_var,
+                                                                     g_tilde,
+                                                                     alpha=sampled_alpha,
+                                                                     normalization=args.grad_normalization,
+                                                                     stride=args.mix_stride,
+                                                                     debug=False,
+                                                                     rand_pos=args.rand_pos)
+                    # else:
+                        # mixed_x, mixed_y, mixed_lam = gradmix_v2(input_2b_mixed_var,
+                                                                 # target_2b_mixed_var,
+                                                                 # g_tilde,
+                                                                 # alpha=sampled_alpha,
+                                                                 # normalization=args.grad_normalization,
+                                                                 # stride=args.mix_stride,
+                                                                 # debug=False,
+                                                                 # rand_pos=args.rand_pos)
                 else:
                     mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var,
                                                           target_2b_mixed_var,
                                                           g_tilde)
-
                 optimizer.zero_grad()
 
                 if args.new_implementation:
@@ -898,9 +936,10 @@ def main():
             args.clean_lam == 0
 
         need_hour, need_mins, need_secs = convert_secs2time(epoch_time.avg * (args.epochs - epoch))
-        need_time = '[Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs)
-        print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
-                + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
+        if epoch == 0 or (epoch+1)%50 == 0 or (epoch+1) == args.epochs:
+            need_time = '[Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs)
+            print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
+                    + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
         # train for one epoch
         tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
@@ -917,13 +956,18 @@ def main():
         test_acc.append(val_acc)
 
         if args.enable_wandb:
-            wandb_logger.add_scalar('train/loss_ep', tr_los, epoch)
-            wandb_logger.add_scalar('train/top1_ep', tr_acc, epoch)
-            wandb_logger.add_scalar('train/top5_ep', tr_acc5, epoch)
-            wandb_logger.add_scalar('train/error1_ep', 100-tr_acc, epoch)
-            wandb_logger.add_scalar('test/loss', val_los, epoch)
-            wandb_logger.add_scalar('test/top1', val_acc, epoch)
-            wandb_logger.add_scalar('test/error1', 100-val_acc, epoch)
+            if epoch == 0 or (epoch+1)%50 == 0 or (epoch+1) == args.epochs:
+                wandb_commit = True
+            else:
+                wandb_commit = False
+
+            wandb_logger.add_scalar('train/loss_ep', tr_los, epoch, wandb_commit)
+            wandb_logger.add_scalar('train/top1_ep', tr_acc, epoch, wandb_commit)
+            wandb_logger.add_scalar('train/top5_ep', tr_acc5, epoch, wandb_commit)
+            wandb_logger.add_scalar('train/error1_ep', 100-tr_acc, epoch, wandb_commit)
+            wandb_logger.add_scalar('test/loss', val_los, epoch, wandb_commit)
+            wandb_logger.add_scalar('test/top1', val_acc, epoch, wandb_commit)
+            wandb_logger.add_scalar('test/error1', 100-val_acc, epoch, wandb_commit)
 
 
         is_best = False
@@ -931,8 +975,12 @@ def main():
             is_best = True
             best_acc = val_acc
             if args.enable_wandb:
-                wandb_logger.add_scalar('test/best_top1', best_acc, epoch)
-                wandb_logger.add_scalar('test/best_error1', 100-best_acc, epoch)
+                if (epoch+1)%50 == 0 or (epoch+1) == args.epochs:
+                    wandb_commit = True
+                else:
+                    wandb_commit = False
+                wandb_logger.add_scalar('test/best_top1', best_acc, epoch, wandb_commit)
+                wandb_logger.add_scalar('test/best_error1', 100-best_acc, epoch, wandb_commit)
 
         # measure elapsed time
         epoch_time.update(time.time() - start_time)
@@ -942,10 +990,10 @@ def main():
             continue
 
         # save log:
-        if args.dataset != 'tiny-imagenet-200' or epoch == args.epochs:
+        if args.dataset != 'tiny-imagenet-200' or (epoch+1) == args.epochs:
             # for both cifar10/cifar100, we do 300 epochs training,
-            # to save training time, we only start saving after 150 epochs
-            if epoch > 150 and is_best:
+            # to save training time, we only start saving after 200 epochs
+            if epoch > 200 and is_best:
                 save_checkpoint(
                     {
                         'epoch': epoch + 1,
