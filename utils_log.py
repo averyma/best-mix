@@ -24,13 +24,23 @@ class wandbLogger(object):
                                     project=args.wandb_project,
                                     dir=args.root_dir,
                                     resume='allow',
-                                    id=str(args.job_id))
+                                    id=str(args.job_id),
+                                    mode=args.wandb_mode)
         self.wandb_log.config.update(args)
 
-    def add_scalar(self, name, val, step, commit=True):
+#     def add_scalar(self, name, val, step, commit=True):
         # self.writer.add_scalar(name, val, step)
 
-        if "_itr" in name:
-            self.wandb_log.log({"iteration": step, name: float(val)}, commit=commit)
-        else:
-            self.wandb_log.log({"epoch": step, name: float(val)}, commit=commit)
+        # if "_itr" in name:
+            # self.wandb_log.log({"iteration": step, name: float(val)}, commit=commit)
+        # else:
+#         self.wandb_log.log({"epoch": step, name: float(val)}, commit=commit)
+        
+    def add_scalar(self, saved_result):
+        # self.writer.add_scalar(name, val, step)
+
+        # if "_itr" in name:
+            # self.wandb_log.log({"iteration": step, name: float(val)}, commit=commit)
+        # else:
+        self.wandb_log.log(saved_result)
+

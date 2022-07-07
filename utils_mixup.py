@@ -12,6 +12,7 @@ import numpy as np
 import os
 import random
 import ipdb
+import time
 
 from mixup import to_one_hot
 
@@ -88,7 +89,7 @@ def gradmix_v2(x, y, grad, alpha=1, normalization='standard', stride=10, debug=F
 
     # rand_pos is 0: double forloop
     # rand_pos is 1: random sampling the same number of time as if we are doing double for loop
-    # rand_pos > 1: random sampling, with number *= rand_pos
+    # rand_pos > 1: random sampling, with number /= rand_pos
     if rand_pos:
         total_iteration = int((len(range(0,w,stride))**2)/rand_pos)
 
@@ -129,8 +130,8 @@ def gradmix_v2(x, y, grad, alpha=1, normalization='standard', stride=10, debug=F
 
     return mixed_x.detach(), mixed_y, mixed_lam
 
-def pad_zeros(input_2b_padded, a, b, c, d):
-    padded_input = torch.nn.functional.pad(input_2b_padded, [a, b, c, d], mode='constant', value=0.0)
+def pad_zeros(input_2b_padded, left, right, top, bottom):
+    padded_input = torch.nn.functional.pad(input_2b_padded, [left, right, top, bottom], mode='constant', value=0.0)
     return padded_input
 
 def reweighted_lam(mixed_y, mixed_lam, num_classes):
@@ -162,7 +163,7 @@ def gradmix_v2_improved(x, y, grad, alpha=1, normalization='standard', stride=10
 
     # rand_pos is 0: double forloop
     # rand_pos is 1: random sampling the same number of time as if we are doing double for loop
-    # rand_pos > 1: random sampling, with number *= rand_pos
+    # rand_pos > 1: random sampling, with number /= rand_pos
     if rand_pos:
         total_iteration = int((w/stride)**2/rand_pos)
         coord = np.random.randint(low=0, high=w, size=(2,total_iteration))
@@ -198,7 +199,7 @@ def gradmix_v2_improved(x, y, grad, alpha=1, normalization='standard', stride=10
 
     return mixed_x.detach(), mixed_y, mixed_lam
 
-def gradmix_v2_improved_v2(x, y, grad, alpha=1, normalization='standard', stride=10, debug=False, rand_pos=False):
+def gradmix_v2_improved_v2(x, y, grad, alpha=1, normalization='standard', debug=False, rand_pos=1):
     '''Returns mixed inputs, pairs of targets, and lambda'''
 
     batch_size, c, w, h = np.array(x.size())
@@ -211,8 +212,8 @@ def gradmix_v2_improved_v2(x, y, grad, alpha=1, normalization='standard', stride
     mixed_y = [y, y[index]]
 
     max_criteria = torch.zeros([batch_size]).cuda()
-    best_ij = torch.empty([batch_size, 2], dtype=int)
-    best_ij[:,0]=0
+    best_ij = torch.empty([batch_size, 2], dtype=int).cuda()
+    best_ij[:,0]=32
     best_ij[:,1]=32
     grad_1, grad_2 = grad.cuda(), grad[index, :].cuda()
     mixed_x = torch.zeros_like(x).cuda()
@@ -225,37 +226,40 @@ def gradmix_v2_improved_v2(x, y, grad, alpha=1, normalization='standard', stride
 
     # rand_pos is 0: double forloop
     # rand_pos is 1: random sampling the same number of time as if we are doing double for loop
-    # rand_pos > 1: random sampling, with number *= rand_pos
-    if rand_pos:
-        total_iteration = int((w/stride)**2/rand_pos)
-        coord = np.random.randint(low=0, high=w, size=(2,total_iteration))
+    # rand_pos > 1: random sampling, with number /= rand_pos
+#     if rand_pos:
+#         total_iteration = int((2*(w-1))**2)
+#         coord = np.random.randint(low=1, high=2*w-1, size=(2,total_iteration))
+#         ipdb.set_trace()
+#         print(coord.shape)
 #         rand_coord = np.unique(rand_coord, axis=1)
-    else:
-        _x = np.linspace(0, w-1, int(w/stride))
-        _y = np.linspace(0, w-1, int(w/stride))
-        _xv, _yv = np.meshgrid(_x, _y)
-        coord = np.stack((_xv.astype(int).flatten(), _yv.astype(int).flatten()))
-        coord = np.insert(coord, 0, np.array([0,w]),axis=1)
-
+#     else:
+    possible_positions = int((2*(w-1)))
+    _x = np.linspace(1, 2*w-1, possible_positions)
+    _xv, _yv = np.meshgrid(_x, _x)
+    coord = np.stack((_xv.astype(int).flatten(), _yv.astype(int).flatten()))
+    coord = coord[:,np.random.permutation(coord.shape[1])][:,:int(possible_positions**2*rand_pos)]
+    coord[:,0]=np.array([w,w])
+    
     for _i in range(coord.shape[1]):
         i,j=coord[:,_i]
-        padded_normalized_grad_2 = pad_zeros(normalized_grad_2, w-j,w+j,0+i,2*w-i)
+        padded_normalized_grad_2 = pad_zeros(normalized_grad_2, left=j,right=2*w-j,top=i,bottom=2*w-i)
         M = padded_normalized_grad_1 / (padded_normalized_grad_1+padded_normalized_grad_2+1e-6)
 
         current_saliency = return_center(padded_normalized_grad_1 * M+(padded_normalized_grad_2 * (1-M)), w)
         criteria = current_saliency.sum(dim=[1,2,3])
         update_needed = ((criteria - max_criteria)>0)
-
+        
         if update_needed.sum() >0:
-            best_ij[update_needed,0],best_ij[update_needed,1] = i,j
+            best_ij[update_needed,:] = torch.tensor([i,j]).cuda()
             max_criteria[update_needed] = criteria[update_needed]
 
     for img in range(batch_size):
         i,j = best_ij[img,0].item(), best_ij[img,1].item()
-        padded_normalized_grad_2 = pad_zeros(normalized_grad_2[img], w-j,w+j,0+i,2*w-i).unsqueeze(0)
+        padded_normalized_grad_2 = pad_zeros(normalized_grad_2[img], left=j,right=2*w-j,top=i,bottom=2*w-i).unsqueeze(0)
         M = (padded_normalized_grad_1[img] / (padded_normalized_grad_1[img]+padded_normalized_grad_2+1e-6))
         lambbda = return_center(M,w).mean(dim=[1,2,3])
-        padded_x_2 = pad_zeros(x[index,:][img], w-j,w+j,0+i,2*w-i).unsqueeze(0)
+        padded_x_2 = pad_zeros(x[index,:][img], left=j,right=2*w-j,top=i,bottom=2*w-i).unsqueeze(0)
         mixed_x[img,:,:,:] = return_center(torch.mul(padded_x_1[img].unsqueeze(0), M) + torch.mul(padded_x_2, 1-M), w)
         _mixed_lam[img] = lambbda
 
