@@ -3,6 +3,7 @@ import torchvision
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import datasets, transforms
+import torch.nn.functional as F
 import torch.optim as optim
 
 from tqdm import trange
@@ -234,12 +235,16 @@ def gradmix_v2_improved_v2(x, y, grad, alpha=1, normalization='standard', debug=
 #         print(coord.shape)
 #         rand_coord = np.unique(rand_coord, axis=1)
 #     else:
-    possible_positions = int((2*(w-1)))
-    _x = np.linspace(1, 2*w-1, possible_positions)
-    _xv, _yv = np.meshgrid(_x, _x)
-    coord = np.stack((_xv.astype(int).flatten(), _yv.astype(int).flatten()))
-    coord = coord[:,np.random.permutation(coord.shape[1])][:,:int(possible_positions**2*rand_pos)]
-    coord[:,0]=np.array([w,w])
+    stride=2
+    rand_pos=1
+    total_iteration = int((w/stride)**2/rand_pos)
+    coord = np.random.randint(low=0, high=w, size=(2,total_iteration))
+    # possible_positions = int((2*(w-1)))
+    # _x = np.linspace(1, 2*w-1, possible_positions)
+    # _xv, _yv = np.meshgrid(_x, _x)
+    # coord = np.stack((_xv.astype(int).flatten(), _yv.astype(int).flatten()))
+    # coord = coord[:,np.random.permutation(coord.shape[1])][:,:int(possible_positions**2*rand_pos)]
+    # coord[:,0]=np.array([w,w])
     
     for _i in range(coord.shape[1]):
         i,j=coord[:,_i]
@@ -266,6 +271,175 @@ def gradmix_v2_improved_v2(x, y, grad, alpha=1, normalization='standard', debug=
     mixed_lam = [_mixed_lam.detach(), 1- _mixed_lam.detach()]
 
     del max_criteria, _mixed_lam, index, M
+    del padded_normalized_grad_1, padded_normalized_grad_2, normalized_grad_1, normalized_grad_2, padded_x_1, padded_x_2, best_ij
+
+    return mixed_x.detach(), mixed_y, mixed_lam
+
+def gradmix_v2_improved_v3(x, y, grad, alpha=1, normalization='standard', debug=False, rand_pos=1):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+
+    batch_size, c, w, h = np.array(x.size())
+    if debug:
+        index = torch.tensor([1,4,3,0,2]).cuda()
+    else:
+#         index = torch.range(start=99, end=0, step=-1, dtype=int, device = x.device)
+        index = torch.randperm(batch_size, device = x.device)
+
+    mixed_y = [y, y[index]]
+
+    max_criteria = torch.zeros([batch_size], device = x.device)
+    best_ij = torch.empty([batch_size, 2], dtype=int, device = x.device)
+    best_ij[:,0]=32
+    best_ij[:,1]=32
+    grad_1, grad_2 = grad, grad[index, :]
+    mixed_x = torch.zeros_like(x, device = x.device)
+    _mixed_lam = torch.zeros([batch_size], device = x.device)
+
+    normalized_grad_1 = normalize_grad(grad_1, alpha, normalization)
+    normalized_grad_2 = normalize_grad(grad_2, 1-alpha, normalization)
+    padded_normalized_grad_1 = pad_zeros(normalized_grad_1, w,w,w,w)
+    padded_x_1 = pad_zeros(x, w,w,w,w)
+
+    possible_positions = int((2*w-1))
+    _x = np.linspace(1, 2*w-1, possible_positions, dtype=int)
+    _xv, _yv = np.meshgrid(_x, _x)
+    coord = np.stack((_xv.flatten(), _yv.flatten()))
+    coord = coord[:,np.random.permutation(coord.shape[1])][:,:int(possible_positions**2*rand_pos)]
+    coord[:,0]=np.array([w,w])
+
+    for _i in range(coord.shape[1]):
+        i,j=coord[:,_i]
+        padded_normalized_grad_2 = pad_zeros(normalized_grad_2, left=j,right=2*w-j,top=i,bottom=2*w-i)
+        M = padded_normalized_grad_1 / (padded_normalized_grad_1+padded_normalized_grad_2+1e-6)
+
+        current_saliency = return_center(padded_normalized_grad_1 * M+(padded_normalized_grad_2 * (1-M)), w)
+        criteria = current_saliency.sum(dim=[1,2,3])
+        update_needed = ((criteria - max_criteria)>0)
+        
+        if update_needed.sum() >0:
+            best_ij[update_needed,:] = torch.tensor([i,j], device = x.device)
+            max_criteria[update_needed] = criteria[update_needed]
+        
+    padded_normalized_grad_2 = pad_zeros(normalized_grad_2, w, w, w, w)
+    padded_x_2 = pad_zeros(x[index,:], w,w,w,w)
+    
+    theta = torch.eye(2,3,device=x.device).repeat(batch_size,1,1)
+    theta[:,0,2] = 2*(w-best_ij[:,1])/(3*w)
+    theta[:,1,2] = 2*(w-best_ij[:,0])/(3*w)
+    size = torch.Size((batch_size,c,3*w,3*w))
+    grid = F.affine_grid(theta, size, align_corners=False)
+
+    translated_padded_normalized_grad_2 = F.grid_sample(padded_normalized_grad_2,
+                                                         grid,
+                                                         mode='nearest',
+                                                         padding_mode ='zeros',
+                                                         align_corners=False)
+    M = (padded_normalized_grad_1 / (padded_normalized_grad_1+translated_padded_normalized_grad_2+1e-6))
+    lambbda = return_center(M,w).mean(dim=[1,2,3])
+    translated_padded_x_2 = F.grid_sample(padded_x_2,
+                                          grid,
+                                          mode='nearest',
+                                          padding_mode ='zeros',
+                                          align_corners=False)
+    mixed_x = return_center(torch.mul(padded_x_1, M) + torch.mul(translated_padded_x_2, 1-M), w)
+    _mixed_lam = lambbda
+
+    mixed_lam = [_mixed_lam.detach(), 1- _mixed_lam.detach()]
+
+    del max_criteria, _mixed_lam, index, M, grid, size, theta, translated_padded_x_2
+    del padded_normalized_grad_1, padded_normalized_grad_2, normalized_grad_1, normalized_grad_2, padded_x_1, padded_x_2, best_ij
+
+    return mixed_x.detach(), mixed_y, mixed_lam
+
+def gradmix_v2_improved_v4(x, y, grad, alpha=1, normalization='standard', debug=False, rand_pos=1):
+    '''Returns mixed inputs, pairs of targets, and lambda'''
+####################################################################################
+    # init a bunch of variables
+    batch_size, c, w, h = np.array(x.size())
+    if debug:
+        index = torch.tensor([1,4,3,0,2]).cuda()
+    else:
+        # comment/uncomment here for reproducing the same results
+#         index = torch.range(start=99, end=0, step=-1, dtype=int, device = x.device)
+        index = torch.randperm(batch_size, device = x.device)
+
+    mixed_y = [y, y[index]]
+
+    max_criteria = torch.zeros([batch_size], device = x.device)
+    best_ij = torch.empty([batch_size, 2], dtype=int, device = x.device)
+    best_ij[:,0]=32
+    best_ij[:,1]=32
+    grad_1, grad_2 = grad, grad[index, :]
+    mixed_x = torch.zeros_like(x, device = x.device)
+    _mixed_lam = torch.zeros([batch_size], device = x.device)
+
+    normalized_grad_1 = normalize_grad(grad_1, alpha, normalization)
+    normalized_grad_2 = normalize_grad(grad_2, 1-alpha, normalization)
+    padded_normalized_grad_1 = pad_zeros(normalized_grad_1, w,w,w,w)
+    padded_normalized_grad_2 = pad_zeros(normalized_grad_2, w,w,w,w)
+    padded_x_1 = pad_zeros(x, w,w,w,w)
+    padded_x_2 = pad_zeros(x[index,:], w,w,w,w)
+
+    possible_positions = int((2*w-1))
+    _x = torch.linspace(1, 2*w-1, possible_positions, dtype=int, device=x.device)
+    _xv, _yv = torch.meshgrid(_x, _x, indexing='xy')
+    coord = torch.stack((_xv.flatten(), _yv.flatten()))
+    # comment/uncomment here for reproducing the same results
+    coord = coord[:,np.random.permutation(coord.shape[1])][:,:int(possible_positions**2*rand_pos)]
+#     coord = coord[:,:int(possible_positions**2*rand_pos)]
+    coord[0,0],coord[1,0] = w,w
+    
+####################################################################################
+    # iterate over images and find the best position that maximizes saliency
+    theta = torch.eye(2,3,device=x.device).repeat(coord.shape[1],1,1)
+    theta[:,0,2] = 2*(w-coord[1,:])/(3*w)
+    theta[:,1,2] = 2*(w-coord[0,:])/(3*w)
+    size = torch.Size((coord.shape[1],1,3*w,3*w))
+    grid = F.affine_grid(theta, size, align_corners=False)
+    
+    for img in range(batch_size):
+        single_padded_normalized_grad_2 = padded_normalized_grad_2[img].expand(coord.shape[1],1,3*w,3*w)
+        translated_single_padded_normalized_grad_2 = F.grid_sample(single_padded_normalized_grad_2,
+                                                             grid,
+                                                             mode='nearest',
+                                                             padding_mode ='zeros',
+                                                             align_corners=False)
+
+        single_padded_normalized_grad_1 = padded_normalized_grad_1[img].expand(coord.shape[1],1,3*w,3*w)
+
+        M =  single_padded_normalized_grad_1 / (single_padded_normalized_grad_1+translated_single_padded_normalized_grad_2+1e-6)
+
+        saliency = return_center(single_padded_normalized_grad_1 * M+(translated_single_padded_normalized_grad_2 * (1-M)), w)
+
+        best_ij[img,:] = coord[:,saliency.sum(dim=[1,2,3]).argmax()]
+
+####################################################################################
+    # update mixed images
+    
+    theta = torch.eye(2,3,device=x.device).repeat(batch_size,1,1)
+    theta[:,0,2] = 2*(w-best_ij[:,1])/(3*w)
+    theta[:,1,2] = 2*(w-best_ij[:,0])/(3*w)
+    size = torch.Size((batch_size,c,3*w,3*w))
+    grid = F.affine_grid(theta, size, align_corners=False)
+
+    translated_padded_normalized_grad_2 = F.grid_sample(padded_normalized_grad_2,
+                                                         grid,
+                                                         mode='nearest',
+                                                         padding_mode ='zeros',
+                                                         align_corners=False)
+    M = (padded_normalized_grad_1 / (padded_normalized_grad_1+translated_padded_normalized_grad_2+1e-6))
+    lambbda = return_center(M,w).mean(dim=[1,2,3])
+    translated_padded_x_2 = F.grid_sample(padded_x_2,
+                                          grid,
+                                          mode='nearest',
+                                          padding_mode ='zeros',
+                                          align_corners=False)
+    mixed_x = return_center(torch.mul(padded_x_1, M) + torch.mul(translated_padded_x_2, 1-M), w)
+    _mixed_lam = lambbda
+
+    mixed_lam = [_mixed_lam.detach(), 1- _mixed_lam.detach()]
+
+    del max_criteria, _mixed_lam, index, M, grid, size, theta, translated_padded_x_2, coord
     del padded_normalized_grad_1, padded_normalized_grad_2, normalized_grad_1, normalized_grad_2, padded_x_1, padded_x_2, best_ij
 
     return mixed_x.detach(), mixed_y, mixed_lam
