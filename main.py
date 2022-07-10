@@ -27,7 +27,7 @@ import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
 import torchvision.transforms as transforms
-from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved, gradmix_v2_improved_v2, gradmix_v2_improved_v3
+from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved_v4
 from mixup import to_one_hot, get_lambda
 
 model_names = sorted(
@@ -618,7 +618,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     sampled_alpha = get_lambda(args.mixup_alpha)
                 sampled_alpha *= args.upper_lambda
 
-                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v3(input_2b_mixed_var,
+                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4(input_2b_mixed_var,
                                                                      target_2b_mixed_var,
                                                                      g_tilde,
                                                                      alpha=sampled_alpha,
