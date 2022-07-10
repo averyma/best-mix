@@ -35,12 +35,6 @@ class wandbLogger(object):
             # self.wandb_log.log({"iteration": step, name: float(val)}, commit=commit)
         # else:
 #         self.wandb_log.log({"epoch": step, name: float(val)}, commit=commit)
-        
-    def add_scalar(self, saved_result):
-        # self.writer.add_scalar(name, val, step)
-
-        # if "_itr" in name:
-            # self.wandb_log.log({"iteration": step, name: float(val)}, commit=commit)
-        # else:
-        self.wandb_log.log(saved_result)
+    def add_scalar(self, saved_result, step, commit=True):
+        self.wandb_log.log(saved_result, step=step, commit=commit)
 

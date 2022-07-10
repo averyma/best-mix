@@ -27,7 +27,7 @@ import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
 import torchvision.transforms as transforms
-from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved, gradmix_v2_improved_v2
+from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved, gradmix_v2_improved_v2, gradmix_v2_improved_v3
 from mixup import to_one_hot, get_lambda
 
 model_names = sorted(
@@ -182,6 +182,7 @@ parser.add_argument('--job_id', type=int, default=0)
 
 # added by Avery
 parser.add_argument('--enable_wandb', type=str2bool, default=True)
+parser.add_argument('--wandb_EOT', type=str2bool, default=False)
 parser.add_argument("--wandb_project", default='test')
 parser.add_argument("--wandb_log_freq", default=10, type=int)
 
@@ -206,11 +207,12 @@ parser.add_argument('--new_implementation', type=str2bool, default=True)
 parser.add_argument('--with_shift', type=str2bool, default=True)
 parser.add_argument('--use_yp_argmax', type=str2bool, default=False)
 parser.add_argument('--bce_saliency', type=str2bool, default=False)
+# parser.add_argument('--incorrect_position', type=str2bool, default=False)
 
 parser.add_argument("--rand_pos", default=0.5, type=float)
 # parser.add_argument('--test_param', default=False)
 
-# parser.add_argument("--double_update", default=1., type=float)
+parser.add_argument("--update_ratio", default=1., type=float)
 
 parser.add_argument("--prob_mix", default=1.0, type=float)
 parser.add_argument("--mix_schedule", default='fixed', choices=['fixed','scheduled','delayed'])
@@ -270,7 +272,7 @@ elif args.method == 'puzzle':
 elif args.method == 'ours':
     args.train = 'ours'
 
-if args.enable_wandb:
+if args.enable_wandb and not args.wandb_EOT:
     wandb_logger = wandbLogger(args)
 
 def experiment_name_non_mnist(dataset=args.dataset,
@@ -577,26 +579,23 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     model.train()
 
                 if args.bce_saliency:
-                    # output = model(input_2b_mixed_var)
-                    output, reweighted_target = model(input_2b_mixed_var, target_2b_mixed_var)
+                    # output, reweighted_target = model(input_2b_mixed_var, target_2b_mixed_var)
+                    reweighted_target = to_one_hot(target_2b_mixed_var, args.num_classes)
+                    output = model(input_2b_mixed_var)
                     loss_batch_mean = bce_loss(softmax(output), reweighted_target)
 
-                    # if args.use_yp_argmax:
-                        # loss_batch = criterion_batch(output, output.argmax(dim=1))
-                    # else:
-                        # loss_batch = criterion_batch(output, target_2b_mixed_var)
+                    if args.update_ratio != 1.:
+                        loss_batch_mean *= (1-args.update_ratio)
 
                 else:
                     output = model(input_2b_mixed_var)
-
                     if args.use_yp_argmax:
                         loss_batch = criterion_batch(output, output.argmax(dim=1))
                     else:
                         loss_batch = criterion_batch(output, target_2b_mixed_var)
 
                     loss_batch_mean = torch.mean(loss_batch, dim=0)
-                # if args.double_update != 1.:
-                    # loss_batch_mean *= (1.-args.double_update)
+
                 loss_batch_mean.backward(retain_graph=True)
 
                 model.train()
@@ -613,68 +612,64 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                                                       sigma=(_blur_sigma, _blur_sigma))
                 g_tilde = blurrer(g)
 
-                # if args.with_shift:
-                # if args.mixup_alpha2 == 0.:
                 if args.mixup_alpha == 0.:
                     sampled_alpha = 0.5
                 else:
                     sampled_alpha = get_lambda(args.mixup_alpha)
                 sampled_alpha *= args.upper_lambda
-                # else:
-                    # sampled_alpha = get_lambda(args.mixup_alpha, args.mixup_alpha2)
 
-                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v2(input_2b_mixed_var,
+                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v3(input_2b_mixed_var,
                                                                      target_2b_mixed_var,
                                                                      g_tilde,
                                                                      alpha=sampled_alpha,
                                                                      normalization=args.grad_normalization,
                                                                      debug=False,
                                                                      rand_pos=args.rand_pos)
+
+                if args.update_ratio == 1.:
+                    optimizer.zero_grad()
+
+                reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+                output_mix = model(mixed_x)
+                loss = bce_loss(softmax(output_mix), reweighted_target_mix)
+                if args.update_ratio != 1.:
+                    loss *= args.update_ratio
+                # if args.new_implementation:
+                    # reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+
+                    # if input_std is None:
+                        # output_mix = model(mixed_x)
+                        # loss = bce_loss(softmax(output_mix), reweighted_target_mix)
+                    # else:
+                        # input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                        # input_concat = torch.cat([mixed_x, input_std_var], dim=0)
+
+                        # output_mix = model(input_concat)
+
+                        # reweighted_target_std = to_one_hot(target_std_var, args.num_classes)
+                        # reweighted_target_concat = torch.cat([reweighted_target_mix, reweighted_target_std], dim=0)
+
+                        # target_concat = torch.cat([target_2b_mixed, target_std], dim=0)
+
+                        # loss = bce_loss(softmax(output_mix), reweighted_target_concat)
+
+                        # if args.double_update != 1.:
+                            # loss *= args.double_update
                 # else:
-                    # mixed_x, mixed_y, mixed_lam = gradmix(input_2b_mixed_var,
-                                                          # target_2b_mixed_var,
-                                                          # g_tilde)
-                # if args.double_update == 1.:
-                optimizer.zero_grad()
+                    # # perform mixup and calculate loss
+                    # reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+                    # output_mix = model(mixed_x)
+                    # if input_std is None:
+                        # loss = bce_loss(softmax(output_mix), reweighted_target)
+                    # else:
+                        # loss_mix = bce_loss_sum(softmax(output_mix), reweighted_target)
 
-                if args.new_implementation:
-                    reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+                        # input_std_var, target_std_var = Variable(input_std), Variable(target_std)
+                        # output_std, reweighted_target_std = model(input_std_var, target_std_var)
 
-                    if input_std is None:
-                        output_mix = model(mixed_x)
-                        loss = bce_loss(softmax(output_mix), reweighted_target_mix)
-                    else:
-                        input_std_var, target_std_var = Variable(input_std), Variable(target_std)
-                        input_concat = torch.cat([mixed_x, input_std_var], dim=0)
+                        # loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
 
-                        output_mix = model(input_concat)
-
-                        reweighted_target_std = to_one_hot(target_std_var, args.num_classes)
-                        reweighted_target_concat = torch.cat([reweighted_target_mix, reweighted_target_std], dim=0)
-
-                        target_concat = torch.cat([target_2b_mixed, target_std], dim=0)
-
-                        loss = bce_loss(softmax(output_mix), reweighted_target_concat)
-
-                        # if args.double_update != 1.:
-                            # loss *= args.double_update
-                else:
-                    # perform mixup and calculate loss
-                    reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
-                    output_mix = model(mixed_x)
-                    if input_std is None:
-                        loss = bce_loss(softmax(output_mix), reweighted_target)
-                    else:
-                        loss_mix = bce_loss_sum(softmax(output_mix), reweighted_target)
-
-                        input_std_var, target_std_var = Variable(input_std), Variable(target_std)
-                        output_std, reweighted_target_std = model(input_std_var, target_std_var)
-
-                        loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
-
-                        loss = (loss_std+loss_mix)/batch_size/args.num_classes
-                        # if args.double_update != 1.:
-                            # loss *= args.double_update
+                        # loss = (loss_std+loss_mix)/batch_size/args.num_classes
 
     ########
 
@@ -764,7 +759,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
         batch_time.update(time.time() - end)
         end = time.time()
 
-    if epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs:
+    if (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) or args.wandb_EOT:
         print_log(
             '  **Train** Prec@1 {top1.avg:.3f} Prec@5 {top5.avg:.3f} Error@1 {error1:.3f}'.format(
                 top1=top1, top5=top5, error1=100 - top1.avg), log)
@@ -956,44 +951,43 @@ def main():
 
         need_hour, need_mins, need_secs = convert_secs2time(epoch_time.avg * (args.epochs - epoch))
         need_time = '[Need: {:02d}:{:02d}:{:02d}]'.format(need_hour, need_mins, need_secs)
-        if epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs:
+        if (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) or args.wandb_EOT:
             print_log('\n==>>{:s} [Epoch={:03d}/{:03d}] {:s} [learning_rate={:6.4f}]'.format(time_string(), epoch, args.epochs, need_time, current_learning_rate) \
                     + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
         # train for one epoch
-        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+        try:
+            tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+        except:
+            if args.enable_wandb and args.wandb_EOT:
+                wandb_logger = wandbLogger(args)
+
+                # if epoch+1 != 1: # not crashed on the first epoch
+                for _epoch in range(epoch):
+                    wandb_dict = OrderedDict()
+                    wandb_commit = (_epoch+1 == epoch)
+                    wandb_dict['epoch'] = _epoch+1
+                    wandb_dict['train/loss'] = recorder.epoch_losses[_epoch,0]
+                    wandb_dict['train/top1'] = recorder.epoch_accuracy[_epoch,0]
+                    wandb_dict['test/loss'] = recorder.epoch_losses[_epoch,1]
+                    wandb_dict['test/top1'] = recorder.epoch_accuracy[_epoch,1]
+                    wandb_dict['test/best_top1'] = recorder.epoch_best_accuracy[_epoch]
+                    wandb_dict['train/epoch_time'] = recorder.epoch_time[_epoch]
+                    wandb_logger.add_scalar(wandb_dict, _epoch, wandb_commit)
 
         # evaluate on validation set
-        val_verbose = True if epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs else False
+        val_verbose = True if (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) or args.wandb_EOT else False
         val_acc, val_los = validate(test_loader, net, log, val_verbose)
         if (epoch % 50) == 0 and args.adv_p > 0:
             _, _ = validate(test_loader, net, log, val_verbose, fgsm=True, eps=4, mean=args.mean, std=args.std)
             _, _ = validate(test_loader, net, log, val_verbose, fgsm=True, eps=8, mean=args.mean, std=args.std)
 
-        train_loss.append(tr_los)
-        train_acc.append(tr_acc)
-        test_loss.append(val_los)
-        test_acc.append(val_acc)
-
         is_best = False
         if val_acc > best_acc:
             is_best = True
             best_acc = val_acc
-#             if args.enable_wandb:
-#                 if (epoch+1)%50 == 0 or (epoch+1) == args.epochs:
-#                     wandb_commit = True
-#                 else:
-#                     wandb_commit = False
-#                 wandb_dict['train/best_top1'] = best_acc
-#                 wandb_dict['train/best_error1'] = 100-best_acc
-#                 wandb_logger.add_scalar('test/best_top1', best_acc, epoch, wandb_commit)
-#                 wandb_logger.add_scalar('test/best_error1', 100-best_acc, epoch, wandb_commit)
 
-        if args.enable_wandb and (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs):
-#             if epoch == 0 or (epoch+1)%50 == 0 or (epoch+1) == args.epochs:
-#                 wandb_commit = True
-#             else:
-#                 wandb_commit = False
+        if args.enable_wandb and (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) and not args.wandb_EOT:
             wandb_dict = OrderedDict()
             wandb_dict['epoch'] = int(epoch+1)
             wandb_dict['train/loss_ep'] = float(tr_los)
@@ -1003,44 +997,44 @@ def main():
             wandb_dict['test/loss'] = float(val_los)
             wandb_dict['test/top1'] = float(val_acc)
             wandb_dict['test/error1'] = float(100-val_acc)
-#             wandb_logger.add_scalar('train/loss_ep', tr_los, epoch, wandb_commit)
-#             wandb_logger.add_scalar('train/top1_ep', tr_acc, epoch, wandb_commit)
-#             wandb_logger.add_scalar('train/top5_ep', tr_acc5, epoch, wandb_commit)
-#             wandb_logger.add_scalar('train/error1_ep', 100-tr_acc, epoch, wandb_commit)
-#             wandb_logger.add_scalar('test/loss', val_los, epoch, wandb_commit)
-#             wandb_logger.add_scalar('test/top1', val_acc, epoch, wandb_commit)
-#             wandb_logger.add_scalar('test/error1', 100-val_acc, epoch, wandb_commit)
             wandb_dict['train/best_top1'] = float(best_acc)
             wandb_dict['train/best_error1'] = float(100-best_acc)
             wandb_dict['train/epoch_time'] = float(time.time() - start_time)
-            wandb_logger.add_scalar(wandb_dict)
+            wandb_logger.add_scalar(wandb_dict, epoch)
+
+        train_loss.append(tr_los)
+        train_acc.append(tr_acc)
+        test_loss.append(val_los)
+        test_acc.append(val_acc)
 
         # measure elapsed time
-        epoch_time.update(time.time() - start_time)
+        _epoch_time = time.time()-start_time
+        epoch_time.update(_epoch_time)
         start_time = time.time()
 
         if args.log_off:
             continue
 
         # save log:
-        if args.dataset != 'tiny-imagenet-200' or (epoch+1) == args.epochs:
-            # for both cifar10/cifar100, we do 300 epochs training,
-            # to save training time, we only start saving after 200 epochs
-            if epoch > 200 and is_best:
-                save_checkpoint(
-                    {
-                        'epoch': epoch + 1,
-                        'arch': args.arch,
-                        'state_dict': net.state_dict(),
-                        'recorder': recorder,
-                        'optimizer': optimizer.state_dict(),
-                    }, is_best, exp_dir, 'checkpoint.pth.tar')
+        # this is the checkpoint for tracking best model
+        # 1. never save when training tiny-imagenet
+        # 2. for cifar10/100, we save at the last or at best acc (when epoch>200)
+        if args.dataset != 'tiny-imagenet-200' and ((epoch+1) == args.epochs or (epoch>200 and is_best)):
+            save_checkpoint(
+                {
+                    'epoch': epoch + 1,
+                    'arch': args.arch,
+                    'state_dict': net.state_dict(),
+                    'recorder': recorder,
+                    'optimizer': optimizer.state_dict(),
+                }, is_best, exp_dir, 'checkpoint.pth.tar')
 
-        # checkpoint every epoch every 10 epochs otherwise
+        # this is the checkpoint for slurm pre-emption
+        # checkpoint every 10 epochs
         if epoch+1 % 10 == 0:
             saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
 
-        dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc)
+        dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc, best_acc, _epoch_time)
         if (epoch + 1) % 100 == 0:
             recorder.plot_curve(result_png_path)
 
@@ -1059,21 +1053,30 @@ def main():
     print_log(
         "\nfinal 10 epoch acc (median) : {:.2f} (+- {:.2f})".format(np.median(test_acc[-10:]),
                                                                     acc_var), log)
-    if args.enable_wandb:
-        wandb_dict = OrderedDict()
-        wandb_dict['final/top1 (median)'] = float(np.median(test_acc[-10:]))
-        wandb_dict['final/top1 (+-)'] = float(acc_var)
-        wandb_dict['final/error1'] = float(100-np.median(test_acc[-10:]))
-        wandb_logger.add_scalar(wandb_dict)
-#         wandb_logger.add_scalar('final/top1 (median)', np.median(test_acc[-10:]), epoch)
-#         wandb_logger.add_scalar('final/top1 (+-)', acc_var, epoch)
-#         wandb_logger.add_scalar('final/error1', 100-np.median(test_acc[-10:]), epoch)
+    if args.enable_wandb and args.wandb_EOT:
+        wandb_logger = wandbLogger(args)
+        for _epoch in range(args.epochs):
+            wandb_dict = OrderedDict()
+            wandb_dict['epoch'] = _epoch+1
+            if _epoch+1 == args.epochs:
+                wandb_commit = True
+                wandb_dict['final/top1 (median)'] = float(np.median(test_acc[-10:]))
+                wandb_dict['final/top1 (+-)'] = float(acc_var)
+                wandb_dict['final/error1'] = float(100-np.median(test_acc[-10:]))
+                wandb_dict['final/total_training_time'] = np.sum(recorder.epoch_time)
+                wandb_dict['final/epoch_time (mean)'] = np.mean(recorder.epoch_time)
+            else:
+                wandb_commit = False
+            wandb_dict['train/loss'] = recorder.epoch_losses[_epoch,0]
+            wandb_dict['train/top1'] = recorder.epoch_accuracy[_epoch,0]
+            wandb_dict['test/loss'] = recorder.epoch_losses[_epoch,1]
+            wandb_dict['test/top1'] = recorder.epoch_accuracy[_epoch,1]
+            wandb_dict['test/best_top1'] = recorder.epoch_best_accuracy[_epoch]
+            wandb_dict['train/epoch_time'] = recorder.epoch_time[_epoch]
+            wandb_logger.add_scalar(wandb_dict, _epoch, wandb_commit)
 
     if not args.log_off:
         log.close()
-
-    # os.system("wandb sync "+args.root_dir+'/wandb/latest-run')
-
 
 if __name__ == '__main__':
     main()
