@@ -364,7 +364,7 @@ def gradmix_v2_improved_v4(x, y, grad, alpha=1, normalization='standard', debug=
         else:
             # comment/uncomment here for reproducing the same results
 #             index = torch.range(start=99, end=0, step=-1, dtype=int, device = x.device)
-            index = torch.randperm(batch_size, device = x.device)
+            index = torch.randperm(batch_size)
 
         mixed_y = [y, y[index]]
 
