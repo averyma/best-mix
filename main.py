@@ -30,6 +30,10 @@ import torchvision.transforms as transforms
 from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved_v4
 from mixup import to_one_hot, get_lambda
 
+#import torch.autograd.profiler as profiler
+#from torch.profiler import ProfilerActivity
+from torch.profiler import profile, record_function, ProfilerActivity
+
 model_names = sorted(
     name for name in models.__dict__
     if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
@@ -618,13 +622,17 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                     sampled_alpha = get_lambda(args.mixup_alpha)
                 sampled_alpha *= args.upper_lambda
 
-                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4(input_2b_mixed_var,
+                t = time.time()
+                with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, with_stack=True, profile_memory=True) as prof:
+                    mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4(input_2b_mixed_var,
                                                                      target_2b_mixed_var,
                                                                      g_tilde,
                                                                      alpha=sampled_alpha,
                                                                      normalization=args.grad_normalization,
                                                                      debug=False,
                                                                      rand_pos=args.rand_pos)
+                print("----- {} seconds measured by time for v4 ------".format(time.time()-t))
+                print(prof.key_averages(group_by_stack_n=5).table(sort_by='cpu_time_total', row_limit=10))
 
                 if args.update_ratio == 1.:
                     optimizer.zero_grad()
@@ -956,24 +964,25 @@ def main():
                     + ' [Best : Accuracy={:.2f}, Error={:.2f}]'.format(recorder.max_accuracy(False), 100-recorder.max_accuracy(False)), log)
 
         # train for one epoch
-        try:
-            tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
-        except:
-            if args.enable_wandb and args.wandb_EOT:
-                wandb_logger = wandbLogger(args)
+        tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+        #try:
+        #    tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+        #except:
+        #    if args.enable_wandb and args.wandb_EOT:
+        #        wandb_logger = wandbLogger(args)
 
-                # if epoch+1 != 1: # not crashed on the first epoch
-                for _epoch in range(epoch):
-                    wandb_dict = OrderedDict()
-                    wandb_commit = (_epoch+1 == epoch)
-                    wandb_dict['epoch'] = _epoch+1
-                    wandb_dict['train/loss'] = recorder.epoch_losses[_epoch,0]
-                    wandb_dict['train/top1'] = recorder.epoch_accuracy[_epoch,0]
-                    wandb_dict['test/loss'] = recorder.epoch_losses[_epoch,1]
-                    wandb_dict['test/top1'] = recorder.epoch_accuracy[_epoch,1]
-                    wandb_dict['test/best_top1'] = recorder.epoch_best_accuracy[_epoch]
-                    wandb_dict['train/epoch_time'] = recorder.epoch_time[_epoch]
-                    wandb_logger.add_scalar(wandb_dict, _epoch, wandb_commit)
+        #        # if epoch+1 != 1: # not crashed on the first epoch
+        #        for _epoch in range(epoch):
+        #            wandb_dict = OrderedDict()
+        #            wandb_commit = (_epoch+1 == epoch)
+        #            wandb_dict['epoch'] = _epoch+1
+        #            wandb_dict['train/loss'] = recorder.epoch_losses[_epoch,0]
+        #            wandb_dict['train/top1'] = recorder.epoch_accuracy[_epoch,0]
+        #            wandb_dict['test/loss'] = recorder.epoch_losses[_epoch,1]
+        #            wandb_dict['test/top1'] = recorder.epoch_accuracy[_epoch,1]
+        #            wandb_dict['test/best_top1'] = recorder.epoch_best_accuracy[_epoch]
+        #            wandb_dict['train/epoch_time'] = recorder.epoch_time[_epoch]
+        #            wandb_logger.add_scalar(wandb_dict, _epoch, wandb_commit)
 
         # evaluate on validation set
         val_verbose = True if (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) or args.wandb_EOT else False
