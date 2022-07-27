@@ -53,7 +53,10 @@ class RecorderMeter(object):
 
         self.epoch_time = np.zeros((self.total_epoch),
                                        dtype=np.float32)  # [epoch, epoch_time]
+        self.mix_time = np.zeros((self.total_epoch),
+                                       dtype=np.float32)  # [epoch, epoch_time]
 
+    # def update(self, idx, train_loss, train_acc, val_loss, val_acc, best_acc, epoch_time, mix_time):
     def update(self, idx, train_loss, train_acc, val_loss, val_acc, best_acc, epoch_time):
         assert idx >= 0 and idx < self.total_epoch, 'total_epoch : {} , but update with the {} index'.format(
             self.total_epoch, idx)
@@ -63,6 +66,7 @@ class RecorderMeter(object):
         self.epoch_accuracy[idx, 1] = val_acc
         self.epoch_best_accuracy[idx] = best_acc
         self.epoch_time[idx] = epoch_time
+        # self.mix_time[idx] = mix_time
         self.current_epoch = idx + 1
         return self.max_accuracy(False) == val_acc
 

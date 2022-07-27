@@ -19,3 +19,4 @@ imagenet/checkpoint/*
 !notebook/*.ipynb
 notebook/.ipynb_checkpoints/
 utils_wip.py
+notebook/images/.*

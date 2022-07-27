@@ -4,9 +4,6 @@ from __future__ import division
 import os, sys, shutil, time, random
 from collections import OrderedDict
 
-# os.environ["WANDB_API_KEY"] = "9bc64f558f249643c1805ff63ac9c55f0ef649c4"
-# os.environ["WANDB_MODE"] = "offline"
-
 sys.path.append('..')
 if sys.version_info[0] < 3:
     import cPickle as pickle
@@ -27,7 +24,7 @@ import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
 import torchvision.transforms as transforms
-from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved_v4
+from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved_v4, gradmix_v2_improved_v5, gradmix_v2_improved_v2, gradmix_v2_improved_v4_1, gradmix_v2_improved_v4_1_no_shift
 from mixup import to_one_hot, get_lambda
 
 model_names = sorted(
@@ -208,6 +205,7 @@ parser.add_argument('--with_shift', type=str2bool, default=True)
 parser.add_argument('--use_yp_argmax', type=str2bool, default=False)
 parser.add_argument('--bce_saliency', type=str2bool, default=False)
 # parser.add_argument('--incorrect_position', type=str2bool, default=False)
+# parser.add_argument('--mix_function', type=int, default=0)
 
 parser.add_argument("--rand_pos", default=0.5, type=float)
 # parser.add_argument('--test_param', default=False)
@@ -547,78 +545,68 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
         # integrating our method :AVery
         elif args.train == 'ours':
-
+            # timer_1_start = time.time()
             batch_size = input.shape[0]
             mix_size = int(batch_size*prob_mix)
 
-            # if mix_size is 0, we are simply doing standard training with no DA
-            if mix_size == 0:
-                input_var, target_var = Variable(input), Variable(target)
-                output, reweighted_target = model(input_var, target_var)
+            input_2b_mixed_var = Variable(input, requires_grad=True)
+            target_2b_mixed_var = Variable(target)
 
-                loss = bce_loss(softmax(output), reweighted_target)
+            # calculate saliency
+            if args.eval_mode:
+                model.eval()
             else:
-                if mix_size == batch_size:
-                    # entire batch is DA
-                    input_2b_mixed = input
-                    target_2b_mixed = target
-                    input_std = None
-                    target_std = None
-                else:
-                    # some inputs are augmented, some are not
-                    input_std, input_2b_mixed = input[:(batch_size-mix_size)], input[(batch_size-mix_size):]
-                    target_std, target_2b_mixed = target[:(batch_size-mix_size)], target[(batch_size-mix_size):]
-
-                input_2b_mixed_var = Variable(input_2b_mixed, requires_grad=True)
-                target_2b_mixed_var = Variable(target_2b_mixed)
-
-                # calculate saliency
-                if args.eval_mode:
-                    model.eval()
-                else:
-                    model.train()
-
-                if args.bce_saliency:
-                    # output, reweighted_target = model(input_2b_mixed_var, target_2b_mixed_var)
-                    reweighted_target = to_one_hot(target_2b_mixed_var, args.num_classes)
-                    output = model(input_2b_mixed_var)
-                    loss_batch_mean = bce_loss(softmax(output), reweighted_target)
-
-                    if args.update_ratio != 1.:
-                        loss_batch_mean *= (1-args.update_ratio)
-
-                else:
-                    output = model(input_2b_mixed_var)
-                    if args.use_yp_argmax:
-                        loss_batch = criterion_batch(output, output.argmax(dim=1))
-                    else:
-                        loss_batch = criterion_batch(output, target_2b_mixed_var)
-
-                    loss_batch_mean = torch.mean(loss_batch, dim=0)
-
-                loss_batch_mean.backward(retain_graph=True)
-
                 model.train()
 
-                g = input_2b_mixed_var.grad.data.abs().mean(dim=1, keepdim=True).detach()
+            if args.bce_saliency:
+                # output, reweighted_target = model(input_2b_mixed_var, target_2b_mixed_var)
+                reweighted_target = to_one_hot(target_2b_mixed_var, args.num_classes)
+                output = model(input_2b_mixed_var)
+                loss_batch_mean = bce_loss(softmax(output), reweighted_target)
 
-                # apply gaussian bluring to the gradients
-                if args.blur_sigma == 100:
-                    if args.dataset == 'tiny-imagenet-200':
-                        _blur_sigma = np.random.uniform(low=2.0, high=3.0)
-                    else:
-                        _blur_sigma = np.random.uniform(low=1.0, high=2.0)
-                    blurrer = transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
-                                                      sigma=(_blur_sigma, _blur_sigma))
-                g_tilde = blurrer(g)
-
-                if args.mixup_alpha == 0.:
-                    sampled_alpha = 0.5
+                if args.update_ratio != 1.:
+                    loss_batch_mean *= (1-args.update_ratio)
+            else:
+                output = model(input_2b_mixed_var)
+                if args.use_yp_argmax:
+                    loss_batch = criterion_batch(output, output.argmax(dim=1))
                 else:
-                    sampled_alpha = get_lambda(args.mixup_alpha)
-                sampled_alpha *= args.upper_lambda
+                    loss_batch = criterion_batch(output, target_2b_mixed_var)
 
-                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4(input_2b_mixed_var,
+                loss_batch_mean = torch.mean(loss_batch, dim=0)
+
+            loss_batch_mean.backward(retain_graph=True)
+
+            model.train()
+
+            g = input_2b_mixed_var.grad.data.abs().mean(dim=1, keepdim=True).detach()
+
+            # apply gaussian bluring to the gradients
+            if args.blur_sigma == 100:
+                if args.dataset == 'tiny-imagenet-200':
+                    _blur_sigma = np.random.uniform(low=2.0, high=3.0)
+                else:
+                    _blur_sigma = np.random.uniform(low=1.0, high=2.0)
+                blurrer = transforms.GaussianBlur(kernel_size=(args.kernel_size, args.kernel_size),
+                                                  sigma=(_blur_sigma, _blur_sigma))
+            g_tilde = blurrer(g)
+
+            if args.mixup_alpha == 0.:
+                sampled_alpha = 0.5
+            else:
+                sampled_alpha = get_lambda(args.mixup_alpha)
+            sampled_alpha *= args.upper_lambda
+            
+            if args.with_shift:
+                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4_1(input_2b_mixed_var,
+                                                                     target_2b_mixed_var,
+                                                                     g_tilde,
+                                                                     alpha=sampled_alpha,
+                                                                     normalization=args.grad_normalization,
+                                                                     debug=False,
+                                                                     rand_pos=args.rand_pos)
+            else:
+                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4_1_no_shift(input_2b_mixed_var,
                                                                      target_2b_mixed_var,
                                                                      g_tilde,
                                                                      alpha=sampled_alpha,
@@ -626,53 +614,15 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
                                                                      debug=False,
                                                                      rand_pos=args.rand_pos)
 
-                if args.update_ratio == 1.:
-                    optimizer.zero_grad()
+            if args.update_ratio == 1.:
+                optimizer.zero_grad()
 
-                reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
-                output_mix = model(mixed_x)
-                loss = bce_loss(softmax(output_mix), reweighted_target_mix)
-                if args.update_ratio != 1.:
-                    loss *= args.update_ratio
-                # if args.new_implementation:
-                    # reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
-
-                    # if input_std is None:
-                        # output_mix = model(mixed_x)
-                        # loss = bce_loss(softmax(output_mix), reweighted_target_mix)
-                    # else:
-                        # input_std_var, target_std_var = Variable(input_std), Variable(target_std)
-                        # input_concat = torch.cat([mixed_x, input_std_var], dim=0)
-
-                        # output_mix = model(input_concat)
-
-                        # reweighted_target_std = to_one_hot(target_std_var, args.num_classes)
-                        # reweighted_target_concat = torch.cat([reweighted_target_mix, reweighted_target_std], dim=0)
-
-                        # target_concat = torch.cat([target_2b_mixed, target_std], dim=0)
-
-                        # loss = bce_loss(softmax(output_mix), reweighted_target_concat)
-
-                        # if args.double_update != 1.:
-                            # loss *= args.double_update
-                # else:
-                    # # perform mixup and calculate loss
-                    # reweighted_target = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
-                    # output_mix = model(mixed_x)
-                    # if input_std is None:
-                        # loss = bce_loss(softmax(output_mix), reweighted_target)
-                    # else:
-                        # loss_mix = bce_loss_sum(softmax(output_mix), reweighted_target)
-
-                        # input_std_var, target_std_var = Variable(input_std), Variable(target_std)
-                        # output_std, reweighted_target_std = model(input_std_var, target_std_var)
-
-                        # loss_std = bce_loss_sum(softmax(output_std), reweighted_target_std)
-
-                        # loss = (loss_std+loss_mix)/batch_size/args.num_classes
-
+            reweighted_target_mix = reweighted_lam(mixed_y, mixed_lam, args.num_classes)
+            output_mix = model(mixed_x)
+            loss = bce_loss(softmax(output_mix), reweighted_target_mix)
+            if args.update_ratio != 1.:
+                loss *= args.update_ratio
     ########
-
         # for manifold mixup
         elif args.train == 'mixup_hidden':
             batch_size = input.shape[0]
@@ -723,30 +673,34 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
 
         # measure accuracy and record loss
         if args.train in ['mixup', 'mixup_hidden']:
-            if mix_size == 0:
-                prec1, prec5 = accuracy(output, target, topk=(1, 5))
-            elif mix_size == batch_size:
-                prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
-            else:
-                prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
-                prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
-                prec1 = prec1_mix + prec1_std
-                prec5 = prec5_mix + prec5_std
+            # if mix_size == 0:
+                # prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            # elif mix_size == batch_size:
+                # prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+            # else:
+                # prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+                # prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
+                # prec1 = prec1_mix + prec1_std
+                # prec5 = prec5_mix + prec5_std
+            prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
         elif args.train == 'ours':
-            if mix_size == 0:
-                prec1, prec5 = accuracy(output, target, topk=(1, 5))
-            elif mix_size == batch_size:
-                prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
-            else:
-                if args.new_implementation:
-                    prec1, prec5 = accuracy(output_mix, target_concat, topk=(1, 5))
-                else:
-                    prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
-                    prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
-                    prec1 = prec1_mix + prec1_std
-                    prec5 = prec5_mix + prec5_std
+            # if mix_size == 0:
+                # prec1, prec5 = accuracy(output, target, topk=(1, 5))
+            # elif mix_size == batch_size:
+                # prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+            # else:
+                # if args.new_implementation:
+                    # prec1, prec5 = accuracy(output_mix, target_concat, topk=(1, 5))
+                # else:
+                    # prec1_mix, prec5_mix = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+                    # prec1_std, prec5_std = accuracy(output_std, target_std, topk=(1, 5))
+                    # prec1 = prec1_mix + prec1_std
+                    # prec5 = prec5_mix + prec5_std
+            # prec1, prec5 = accuracy(output_mix, target_2b_mixed, topk=(1, 5))
+            prec1, prec5 = accuracy(output_mix, target, topk=(1, 5))
         elif args.train == 'vanilla':
             prec1, prec5 = accuracy(output, target, topk=(1, 5))
+
         losses.update(loss.item(), input.size(0))
         top1.update(prec1.item(), input.size(0))
         top5.update(prec5.item(), input.size(0))
@@ -758,6 +712,7 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
+
 
     if (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) or args.wandb_EOT:
         print_log(
@@ -937,7 +892,7 @@ def main():
     else:
         mp = None
 
-    start_time = time.time()
+    # start_time = time.time()
     epoch_time = AverageMeter()
     train_loss = []
     train_acc = []
@@ -957,7 +912,10 @@ def main():
 
         # train for one epoch
         try:
+            start_time = time.time()
             tr_acc, tr_acc5, tr_los = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+            # tr_acc, tr_acc5, tr_los, mix_time = train(train_loader, net, optimizer, epoch, args, log, mp=mp)
+            _epoch_time = time.time()-start_time
         except:
             if args.enable_wandb and args.wandb_EOT:
                 wandb_logger = wandbLogger(args)
@@ -973,7 +931,9 @@ def main():
                     wandb_dict['test/top1'] = recorder.epoch_accuracy[_epoch,1]
                     wandb_dict['test/best_top1'] = recorder.epoch_best_accuracy[_epoch]
                     wandb_dict['train/epoch_time'] = recorder.epoch_time[_epoch]
+                    # wandb_dict['train/mix_time'] = recorder.mix_time[_epoch]
                     wandb_logger.add_scalar(wandb_dict, _epoch, wandb_commit)
+            break
 
         # evaluate on validation set
         val_verbose = True if (epoch == 0 or (epoch+1)%args.wandb_log_freq == 0 or (epoch+1) == args.epochs) or args.wandb_EOT else False
@@ -999,7 +959,8 @@ def main():
             wandb_dict['test/error1'] = float(100-val_acc)
             wandb_dict['train/best_top1'] = float(best_acc)
             wandb_dict['train/best_error1'] = float(100-best_acc)
-            wandb_dict['train/epoch_time'] = float(time.time() - start_time)
+            # wandb_dict['train/epoch_time'] = float(time.time() - start_time)
+            wandb_dict['train/epoch_time'] = float(_epoch_time)
             wandb_logger.add_scalar(wandb_dict, epoch)
 
         train_loss.append(tr_los)
@@ -1008,9 +969,8 @@ def main():
         test_acc.append(val_acc)
 
         # measure elapsed time
-        _epoch_time = time.time()-start_time
         epoch_time.update(_epoch_time)
-        start_time = time.time()
+        # start_time = time.time()
 
         if args.log_off:
             continue
@@ -1031,9 +991,10 @@ def main():
 
         # this is the checkpoint for slurm pre-emption
         # checkpoint every 10 epochs
-        if epoch+1 % 10 == 0:
+        if (epoch+1) % 20 == 0:
             saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
 
+        # dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc, best_acc, _epoch_time, mix_time)
         dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc, best_acc, _epoch_time)
         if (epoch + 1) % 100 == 0:
             recorder.plot_curve(result_png_path)
@@ -1053,6 +1014,9 @@ def main():
     print_log(
         "\nfinal 10 epoch acc (median) : {:.2f} (+- {:.2f})".format(np.median(test_acc[-10:]),
                                                                     acc_var), log)
+    print_log(
+        "\naverage epoch time: {:.2f}".format(np.mean(recorder.epoch_time)), log)
+
     if args.enable_wandb and args.wandb_EOT:
         wandb_logger = wandbLogger(args)
         for _epoch in range(args.epochs):
@@ -1065,6 +1029,7 @@ def main():
                 wandb_dict['final/error1'] = float(100-np.median(test_acc[-10:]))
                 wandb_dict['final/total_training_time'] = np.sum(recorder.epoch_time)
                 wandb_dict['final/epoch_time (mean)'] = np.mean(recorder.epoch_time)
+                # wandb_dict['final/mix_time (mean)'] = np.mean(recorder.mix_time)
             else:
                 wandb_commit = False
             wandb_dict['train/loss'] = recorder.epoch_losses[_epoch,0]
@@ -1073,6 +1038,7 @@ def main():
             wandb_dict['test/top1'] = recorder.epoch_accuracy[_epoch,1]
             wandb_dict['test/best_top1'] = recorder.epoch_best_accuracy[_epoch]
             wandb_dict['train/epoch_time'] = recorder.epoch_time[_epoch]
+            # wandb_dict['train/mix_time'] = recorder.mix_time[_epoch]
             wandb_logger.add_scalar(wandb_dict, _epoch, wandb_commit)
 
     if not args.log_off:
