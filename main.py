@@ -219,6 +219,8 @@ parser.add_argument("--mix_scheduled_epoch", default=300, type=int)
 parser.add_argument("--upper_lambda", default=1.0, type=float)
 parser.add_argument("--mixup_alpha2", default=0., type=float)
 
+parser.add_argument('--vector', type=str2bool, default=True)
+
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
 
@@ -975,24 +977,25 @@ def main():
         if args.log_off:
             continue
 
-        # save log:
-        # this is the checkpoint for tracking best model
-        # 1. never save when training tiny-imagenet
-        # 2. for cifar10/100, we save at the last or at best acc (when epoch>200)
-        if args.dataset != 'tiny-imagenet-200' and ((epoch+1) == args.epochs or (epoch>200 and is_best)):
-            save_checkpoint(
-                {
-                    'epoch': epoch + 1,
-                    'arch': args.arch,
-                    'state_dict': net.state_dict(),
-                    'recorder': recorder,
-                    'optimizer': optimizer.state_dict(),
-                }, is_best, exp_dir, 'checkpoint.pth.tar')
+        if args.vector:
+            # save log:
+            # this is the checkpoint for tracking best model
+            # 1. never save when training tiny-imagenet
+            # 2. for cifar10/100, we save at the last or at best acc (when epoch>200)
+            if args.dataset != 'tiny-imagenet-200' and ((epoch+1) == args.epochs or (epoch>200 and is_best)):
+                save_checkpoint(
+                    {
+                        'epoch': epoch + 1,
+                        'arch': args.arch,
+                        'state_dict': net.state_dict(),
+                        'recorder': recorder,
+                        'optimizer': optimizer.state_dict(),
+                    }, is_best, exp_dir, 'checkpoint.pth.tar')
 
-        # this is the checkpoint for slurm pre-emption
-        # checkpoint every 10 epochs
-        if (epoch+1) % 20 == 0:
-            saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
+            # this is the checkpoint for slurm pre-emption
+            # checkpoint every 10 epochs
+            if (epoch+1) % 20 == 0:
+                saveCheckpoint(ckpt_dir, "custom_ckpt", epoch+1, net.state_dict(), recorder, optimizer.state_dict())
 
         # dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc, best_acc, _epoch_time, mix_time)
         dummy = recorder.update(epoch, tr_los, tr_acc, val_los, val_acc, best_acc, _epoch_time)
