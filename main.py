@@ -24,7 +24,7 @@ import ipdb
 from utils_log import wandbLogger, saveCheckpoint
 import torchvision
 import torchvision.transforms as transforms
-from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved_v4, gradmix_v2_improved_v5, gradmix_v2_improved_v2, gradmix_v2_improved_v4_1, gradmix_v2_improved_v4_1_no_shift
+from utils_mixup import gradmix, reweighted_lam, gradmix_v2, gradmix_v2_improved_v4, gradmix_v2_improved_v5, gradmix_v2_improved_v2, gradmix_v2_improved_v4_1, gradmix_v2_improved_v4_1_no_shift, gradmix_v2_improved_v4_1_no_SM
 from mixup import to_one_hot, get_lambda
 
 model_names = sorted(
@@ -220,6 +220,7 @@ parser.add_argument("--upper_lambda", default=1.0, type=float)
 parser.add_argument("--mixup_alpha2", default=0., type=float)
 
 parser.add_argument('--vector', type=str2bool, default=True)
+parser.add_argument('--no_SM', type=str2bool, default=False)
 
 args = parser.parse_args()
 args.use_cuda = args.ngpu > 0 and torch.cuda.is_available()
@@ -598,15 +599,24 @@ def train(train_loader, model, optimizer, epoch, args, log, mp=None):
             else:
                 sampled_alpha = get_lambda(args.mixup_alpha)
             sampled_alpha *= args.upper_lambda
-            
+
             if args.with_shift:
-                mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4_1(input_2b_mixed_var,
-                                                                     target_2b_mixed_var,
-                                                                     g_tilde,
-                                                                     alpha=sampled_alpha,
-                                                                     normalization=args.grad_normalization,
-                                                                     debug=False,
-                                                                     rand_pos=args.rand_pos)
+                if args.no_SM:
+                    mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4_1_no_SM(input_2b_mixed_var,
+                                                                         target_2b_mixed_var,
+                                                                         g_tilde,
+                                                                         alpha=sampled_alpha,
+                                                                         normalization=args.grad_normalization,
+                                                                         debug=False,
+                                                                         rand_pos=args.rand_pos)
+                else:
+                    mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4_1(input_2b_mixed_var,
+                                                                         target_2b_mixed_var,
+                                                                         g_tilde,
+                                                                         alpha=sampled_alpha,
+                                                                         normalization=args.grad_normalization,
+                                                                         debug=False,
+                                                                         rand_pos=args.rand_pos)
             else:
                 mixed_x, mixed_y, mixed_lam = gradmix_v2_improved_v4_1_no_shift(input_2b_mixed_var,
                                                                      target_2b_mixed_var,
