@@ -27,7 +27,7 @@ echo "#!/bin/bash
 #SBATCH --mem=$[8*$resource]GB
 #SBATCH --gres=gpu:${resource}
 #SBATCH --nodes=1
-#SBATCH --qos=normal
+#SBATCH --qos=high
 bash ${j_dir}/scripts/${j_name}.sh
 " > $j_dir/scripts/${j_name}.slrm
 
